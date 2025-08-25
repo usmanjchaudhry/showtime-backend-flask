@@ -3,3 +3,4 @@ Flask-Cors>=4,<5
 python-dotenv>=1,<2
 supabase>=2,<3
 websockets>=14,<16
+stripe>=8,<12
