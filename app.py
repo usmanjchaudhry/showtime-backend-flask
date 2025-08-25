@@ -116,6 +116,36 @@ def list_profiles():
         return jsonify(rows)
     except Exception as e:
         return err(f"query failed: {e}", 500)
+    # ───────────────────────── current user's profile ───────────────────
+@app.get("/api/profile/me")
+def my_profile():
+    # Expect: Authorization: Bearer <access_token>
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return err("missing or invalid Authorization header", 401)
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        # Validate token and get user id
+        res = sb_public.auth.get_user(token)
+        uid = res.user.id  # v2: get_user returns an object with .user
+    except Exception as e:
+        return err(f"invalid token: {e}", 401)
+
+    try:
+        data = (
+            sb_admin.table("user_profiles")
+            .select("user_id,email,first_name,last_name,is_admin")
+            .eq("user_id", uid)
+            .single()
+            .execute()
+            .data
+        )
+        if not data:
+            return err("profile not found", 404)
+        return jsonify(data)
+    except Exception as e:
+        return err(f"profile lookup failed: {e}", 500)
 
 # ───────────────────────── run dev server ──────────────────────────
 if __name__ == "__main__":
