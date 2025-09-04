@@ -4,3 +4,10 @@ python-dotenv>=1,<2
 supabase>=2,<3
 websockets>=14,<16
 stripe>=8,<12
+
+# needed for PDF generation
+reportlab>=4,<5
+Pillow>=10,<12
+
+# optional but recommended for production serving
+gunicorn>=21,<22
