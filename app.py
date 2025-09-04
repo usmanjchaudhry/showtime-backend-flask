@@ -2,11 +2,7 @@
 import os
 import json
 import logging
-import hashlib
 import traceback
-import hmac
-import base64
-import time
 import calendar
 from uuid import uuid4
 from time import perf_counter
@@ -17,18 +13,20 @@ from flask import Flask, jsonify, request, make_response, g
 from dotenv import load_dotenv
 from flask_cors import CORS
 from functools import wraps
+from werkzeug.exceptions import HTTPException
 
 import stripe
 
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
-import io, textwrap
+
+import io
+import textwrap
+import base64
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
-
-WAIVER_BUCKET = os.getenv("WAIVER_BUCKET", "waivers")
 
 # ────────────────────────── env / clients ──────────────────────────
 load_dotenv()
@@ -40,11 +38,7 @@ ANON_KEY = os.getenv("SUPABASE_ANON")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-STRIPE_PRICE_ID_MONTHLY = os.getenv("STRIPE_PRICE_ID_MONTHLY")  # optional seed helper
-ENABLE_DEV_ROUTES = os.getenv("ENABLE_DEV_ROUTES", "0") == "1"
-
-# Optional: enable QR flow by setting this
-CHECKIN_QR_SECRET = os.getenv("CHECKIN_QR_SECRET")
+WAIVER_BUCKET = os.getenv("WAIVER_BUCKET", "waivers")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -71,15 +65,18 @@ log = logging.getLogger("api")
 app = Flask(__name__)
 CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
 CORS(
-app,
-    resources={r"/(signup|login|api/.*|ping|dev/.*|debug/.*)": {"origins": CORS_ORIGINS}},
+    app,
+    resources={r"/(signup|login|api/.*|ping)": {"origins": CORS_ORIGINS}},
     supports_credentials=True,
     allow_headers=["Content-Type", "Authorization", "x-request-id"],
     expose_headers=["x-request-id"],
 )
+
+
 def err(msg, code=400):
     log.warning(f"ERR {code}: {msg}")
     return make_response({"error": str(msg)}, code)
+
 
 # ────────────────────────── request/response logs ──────────────────
 @app.before_request
@@ -98,16 +95,24 @@ def _log_request_start():
         except Exception:
             log.info(f"[{g._rid}] body=<non-json>")
 
+
 @app.after_request
 def _log_response(resp):
     dur_ms = (perf_counter() - g.get("_start", perf_counter())) * 1000
     log.info(f"[{g.get('_rid','-')}] ← {resp.status_code} {resp.content_type} {dur_ms:.1f}ms")
     return resp
 
+
 @app.errorhandler(Exception)
 def _unhandled(e):
-    log.error(f"[{g.get('_rid','-')}] !!! {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    rid = g.get("_rid", "-")
+    if isinstance(e, HTTPException):
+        # Preserve real HTTP codes (e.g., 404) instead of turning them into 500s
+        log.warning(f"[{rid}] http {e.code}: {e.description}")
+        return make_response({"error": e.description}, e.code)
+    log.error(f"[{rid}] !!! {type(e).__name__}: {e}\n{traceback.format_exc()}")
     return err("internal server error", 500)
+
 
 # ────────────────────────── auth helpers ───────────────────────────
 def _bearer():
@@ -115,6 +120,7 @@ def _bearer():
     if auth.startswith("Bearer "):
         return auth[7:].strip()
     return None
+
 
 def auth_required(fn):
     @wraps(fn)
@@ -133,7 +139,9 @@ def auth_required(fn):
         except Exception as e:
             return err(f"invalid token: {e}", 401)
         return fn(*args, **kwargs)
+
     return wrapper
+
 
 def admin_required(fn):
     @wraps(fn)
@@ -156,7 +164,9 @@ def admin_required(fn):
         if not is_admin:
             return err("forbidden", 403)
         return fn(*args, **kwargs)
+
     return wrapper
+
 
 # ────────────────────────── small utils ────────────────────────────
 def ensure_bucket(name: str):
@@ -168,11 +178,13 @@ def ensure_bucket(name: str):
     except Exception as e:
         app.logger.warning(f"[storage] ensure bucket failed: {e}")
 
+
 def parse_data_url_png(data_url: str) -> bytes:
     if not data_url or not data_url.startswith("data:image"):
         return b""
     header, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
+
 
 def build_waiver_pdf(waiver, full_name, dob_str, signed_at_dt, ip, ua, sig_png_bytes: bytes) -> bytes:
     buf = io.BytesIO()
@@ -232,8 +244,10 @@ def build_waiver_pdf(waiver, full_name, dob_str, signed_at_dt, ip, ua, sig_png_b
     buf.seek(0)
     return buf.read()
 
+
 def to_utc_ts(sec: int) -> datetime:
     return datetime.fromtimestamp(sec, tz=timezone.utc)
+
 
 def add_interval(dt: datetime, interval: str, count: int) -> datetime:
     """Add a plan interval to a datetime (supports day/week/month/year)."""
@@ -255,6 +269,7 @@ def add_interval(dt: datetime, interval: str, count: int) -> datetime:
         except ValueError:
             return dt.replace(month=2, day=28, year=dt.year + count)
     return dt + timedelta(days=count)
+
 
 def get_or_create_stripe_customer(user_id: str) -> str:
     prof = (
@@ -283,6 +298,7 @@ def get_or_create_stripe_customer(user_id: str) -> str:
     sb_admin.table("user_profiles").update({"stripe_customer_id": cid}).eq("user_id", user_id).execute()
     log.info(f"[{g._rid}] created stripe customer {cid} for user {user_id}")
     return cid
+
 
 def ensure_membership(
     owner_user_id: str,
@@ -357,6 +373,7 @@ def ensure_membership(
     log.info(f"[{g._rid}] created membership {mem['id']} payload={payload}")
     return mem
 
+
 def has_signed_required_waiver(subject_type: str, subject_id: str) -> bool:
     """Return True if there's no required waiver OR the subject signed the current version."""
     rid = getattr(g, "_rid", "-")
@@ -376,7 +393,9 @@ def has_signed_required_waiver(subject_type: str, subject_id: str) -> bool:
         return True
 
     w = waivers[0]
-    log.info(f"[{rid}] WAIVER_CHECK active waiver id={w['id']} version={w['version']} required={w['required_for_purchase']}")
+    log.info(
+        f"[{rid}] WAIVER_CHECK active waiver id={w['id']} version={w['version']} required={w['required_for_purchase']}"
+    )
 
     q = (
         sb_admin.table("waiver_signatures")
@@ -396,7 +415,7 @@ def has_signed_required_waiver(subject_type: str, subject_id: str) -> bool:
     return signed
 
 
-# ───────── helpers for access + check-ins + optional QR ────────────
+# ───────── helpers for access + check-ins ────────────
 def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | None) -> bool:
     now = datetime.now(timezone.utc)
     q = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False)
@@ -415,9 +434,10 @@ def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | 
             continue
     return False
 
-def record_checkin(*, subject_type: str, subject_id: str, method: str = "qr",
-                   location: str | None = None, source: str | None = None,
-                   meta: dict | None = None) -> dict:
+
+def record_checkin(
+    *, subject_type: str, subject_id: str, method: str = "qr", location: str | None = None, source: str | None = None, meta: dict | None = None
+) -> dict:
     row = {
         "subject_user_id": subject_id if subject_type == "user" else None,
         "dependent_id": subject_id if subject_type == "dependent" else None,
@@ -430,21 +450,17 @@ def record_checkin(*, subject_type: str, subject_id: str, method: str = "qr",
     rec["has_access_now"] = has_access_now_for_subject(rec.get("subject_user_id"), rec.get("dependent_id"))
     return rec
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
-def _b64url_decode(s: str) -> bytes:
-    padding = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode((s + padding).encode("utf-8"))
+# ───────────────────────── root + health ───────────────────────────
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "showtime-backend", "time": datetime.now(timezone.utc).isoformat()})
 
-def _sign_qr_body(body_b64: str, secret: str) -> str:
-    mac = hmac.new(secret.encode("utf-8"), body_b64.encode("utf-8"), hashlib.sha256).digest()
-    return _b64url(mac)
 
-# ───────────────────────── health check ────────────────────────────
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
 
 # ───────────────────────── signup/login ────────────────────────────
 @app.post("/signup")
@@ -456,9 +472,7 @@ def signup():
         return err("email and password required", 400)
 
     try:
-        res = sb_admin.auth.admin.create_user(
-            {"email": email, "password": password, "email_confirm": True}
-        )
+        res = sb_admin.auth.admin.create_user({"email": email, "password": password, "email_confirm": True})
         uid = res.user.id
         log.info(f"[{g._rid}] created auth user {uid}")
     except Exception as e:
@@ -486,6 +500,7 @@ def signup():
 
     return {"user_id": uid}, 201
 
+
 @app.post("/login")
 def login():
     body = request.get_json(force=True, silent=True) or {}
@@ -508,28 +523,24 @@ def login():
     except Exception as e:
         return err(f"invalid login: {e}", 401)
 
+
 # Legacy guard: block any old endpoint that could bypass waiver
 @app.post("/api/create-checkout-session")
 @auth_required
 def legacy_checkout_block():
     return err("This endpoint is deprecated. Use /api/checkout/session.", 410)
 
+
 # ───────────────────────── profiles / plans ────────────────────────
 @app.get("/api/profile/me")
 @auth_required
 def profile_me():
-    rows = (
-        sb_admin.table("user_profiles")
-        .select("*")
-        .eq("user_id", g.user_id)
-        .limit(1)
-        .execute()
-        .data
-    )
+    rows = sb_admin.table("user_profiles").select("*").eq("user_id", g.user_id).limit(1).execute().data
     if not rows:
         return err("profile not found", 404)
     log.info(f"[{g._rid}] profile_me user_id={g.user_id}")
     return jsonify(rows[0])
+
 
 @app.get("/api/plans")
 def list_plans():
@@ -547,6 +558,7 @@ def list_plans():
         return jsonify(rows)
     except Exception as e:
         return err(f"failed to load plans: {e}", 500)
+
 
 # ───────────────────────── waiver endpoints ────────────────────────
 @app.get("/api/waivers/active")
@@ -578,7 +590,13 @@ def waiver_active():
         return jsonify({"waiver": None, "signed": False})
 
     w = waivers[0]
-    q = sb_admin.table("waiver_signatures").select("id").eq("waiver_id", w["id"]).eq("waiver_version", w["version"]).is_("revoked_at", "null")
+    q = (
+        sb_admin.table("waiver_signatures")
+        .select("id")
+        .eq("waiver_id", w["id"])
+        .eq("waiver_version", w["version"])
+        .is_("revoked_at", "null")
+    )
     if subject_type == "user":
         q = q.eq("subject_user_id", subject_id)
     else:
@@ -588,6 +606,7 @@ def waiver_active():
 
     log.info(f"[{rid}] /api/waivers/active found id={w['id']} version={w['version']} signed={signed} sig_count={len(sigs)}")
     return jsonify({"waiver": w, "signed": signed})
+
 
 @app.post("/api/waivers/sign")
 @auth_required
@@ -663,7 +682,9 @@ def waiver_sign():
         if sig_png_bytes:
             sig_path = f"signatures/{sig_id}.png"
             log.info(f"[{rid}] [storage] upload signature {sig_path} bytes={len(sig_png_bytes)}")
-            sb_admin.storage.from_(WAIVER_BUCKET).upload(sig_path, sig_png_bytes, {"content-type": "image/png", "upsert": True})
+            sb_admin.storage.from_(WAIVER_BUCKET).upload(
+                sig_path, sig_png_bytes, {"content-type": "image/png", "upsert": True}
+            )
             sig_url = sb_admin.storage.from_(WAIVER_BUCKET).get_public_url(sig_path).get("publicURL")
 
         pdf_bytes = build_waiver_pdf(
@@ -677,7 +698,9 @@ def waiver_sign():
         )
         pdf_path = f"pdf/{sig_id}.pdf"
         log.info(f"[{rid}] [storage] upload pdf {pdf_path} bytes={len(pdf_bytes)}")
-        sb_admin.storage.from_(WAIVER_BUCKET).upload(pdf_path, pdf_bytes, {"content-type": "application/pdf", "upsert": True})
+        sb_admin.storage.from_(WAIVER_BUCKET).upload(
+            pdf_path, pdf_bytes, {"content-type": "application/pdf", "upsert": True}
+        )
         pdf_url = sb_admin.storage.from_(WAIVER_BUCKET).get_public_url(pdf_path).get("publicURL")
 
         sig = (
@@ -714,7 +737,10 @@ def create_checkout_session():
     subject_type = (body.get("subject_type") or "user").lower()
     subject_id = body.get("subject_id")
 
-    log.info(f"[{rid}] /api/checkout/session start subject_type={subject_type} body_subject_id={subject_id} owner={g.user_id} plan_id={plan_id} plan_slug={plan_slug}")
+    log.info(
+        f"[{rid}] /api/checkout/session start subject_type={subject_type} body_subject_id={subject_id} "
+        f"owner={g.user_id} plan_id={plan_id} plan_slug={plan_slug}"
+    )
 
     if subject_type not in ("user", "dependent"):
         return err("subject_type must be 'user' or 'dependent'", 400)
@@ -757,7 +783,10 @@ def create_checkout_session():
         "subject_user_id": g.user_id if subject_type == "user" else "",
         "dependent_id": subject_id if subject_type == "dependent" else "",
     }
-    log.info(f"[{rid}] /api/checkout/session creating stripe session mode={checkout_mode} customer={customer_id} price={price_id} plan={plan['id']} subject_id={subject_id}")
+    log.info(
+        f"[{rid}] /api/checkout/session creating stripe session mode={checkout_mode} "
+        f"customer={customer_id} price={price_id} plan={plan['id']} subject_id={subject_id}"
+    )
 
     try:
         if checkout_mode == "subscription":
@@ -852,17 +881,19 @@ def stripe_webhook():
         start = to_utc_ts(created_ts) if created_ts else datetime.now(timezone.utc)
         end = add_interval(start, plan.get("interval") or "day", plan.get("interval_count") or 1)
 
-        sb_admin.table("membership_periods").insert({
-            "user_membership_id": mem["id"],
-            "owner_user_id": mem["owner_user_id"],
-            "subject_user_id": mem.get("subject_user_id"),
-            "dependent_id": mem.get("dependent_id"),
-            "plan_id": mem["plan_id"],
-            "source": "stripe",
-            "source_ref": external_id,
-            "period_start": start,
-            "period_end": end,
-        }).execute()
+        sb_admin.table("membership_periods").insert(
+            {
+                "user_membership_id": mem["id"],
+                "owner_user_id": mem["owner_user_id"],
+                "subject_user_id": mem.get("subject_user_id"),
+                "dependent_id": mem.get("dependent_id"),
+                "plan_id": mem["plan_id"],
+                "source": "stripe",
+                "source_ref": external_id,
+                "period_start": start,
+                "period_end": end,
+            }
+        ).execute()
 
         # Optional receipt for one-time
         if external_id and amount_total is not None:
@@ -876,20 +907,22 @@ def stripe_webhook():
                 .data
             )
             if not rec_existing:
-                sb_admin.table("payment_receipts").insert({
-                    "user_membership_id": mem["id"],
-                    "owner_user_id": mem["owner_user_id"],
-                    "subject_user_id": mem.get("subject_user_id"),
-                    "dependent_id": mem.get("dependent_id"),
-                    "plan_id": mem["plan_id"],
-                    "source": "stripe",
-                    "external_type": "checkout_session",
-                    "external_id": external_id,
-                    "status": "succeeded",
-                    "amount_cents": int(amount_total or 0),
-                    "currency": (currency or "USD").upper(),
-                    "paid_at": datetime.now(timezone.utc),
-                }).execute()
+                sb_admin.table("payment_receipts").insert(
+                    {
+                        "user_membership_id": mem["id"],
+                        "owner_user_id": mem["owner_user_id"],
+                        "subject_user_id": mem.get("subject_user_id"),
+                        "dependent_id": mem.get("dependent_id"),
+                        "plan_id": mem["plan_id"],
+                        "source": "stripe",
+                        "external_type": "checkout_session",
+                        "external_id": external_id,
+                        "status": "succeeded",
+                        "amount_cents": int(amount_total or 0),
+                        "currency": (currency or "USD").upper(),
+                        "paid_at": datetime.now(timezone.utc),
+                    }
+                ).execute()
 
         # Keep membership active
         sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
@@ -904,7 +937,10 @@ def stripe_webhook():
         subject_user_id = md.get("subject_user_id") or None
         dependent_id = md.get("dependent_id") or None
 
-        log.info(f"checkout.completed mode={mode} cust={customer_id} owner={owner_user_id} plan={plan_id} subj={subject_user_id} dep={dependent_id}")
+        log.info(
+            f"checkout.completed mode={mode} cust={customer_id} owner={owner_user_id} plan={plan_id} "
+            f"subj={subject_user_id} dep={dependent_id}"
+        )
 
         if mode == "subscription":
             sub_id = sess.get("subscription")
@@ -1036,6 +1072,7 @@ def stripe_webhook():
 
     return jsonify({"ok": True})
 
+
 # ───────────────────────── access check ────────────────────────────
 @app.get("/api/access/status")
 @auth_required
@@ -1058,11 +1095,11 @@ def access_status():
 
     rows = q.execute().data or []
     can_enter = any(
-        datetime.fromisoformat(r["period_start"]) <= now < datetime.fromisoformat(r["period_end"])
-        for r in rows
+        datetime.fromisoformat(r["period_start"]) <= now < datetime.fromisoformat(r["period_end"]) for r in rows
     )
     log.info(f"[{g._rid}] access_status subject_type={subject_type} can_enter={can_enter}")
     return jsonify({"subject_type": subject_type, "subject_id": subject_id, "can_enter": can_enter})
+
 
 # ───────────────────────── admin manual/cash periods ───────────────
 @app.post("/api/admin/periods")
@@ -1139,6 +1176,7 @@ def admin_add_period():
     sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
     return jsonify({"ok": True})
 
+
 # ───────────────────────── admin: manual check-in ──────────────────
 @app.post("/api/admin/checkins")
 @auth_required
@@ -1160,6 +1198,7 @@ def admin_checkin():
     )
     return jsonify({"ok": True, "checkin": rec})
 
+
 # ───────────────────── admin: link Stripe customer ─────────────────
 def _map_subscription_status(status: str) -> str:
     status = (status or "").lower()
@@ -1170,6 +1209,7 @@ def _map_subscription_status(status: str) -> str:
     if status in ("canceled", "incomplete_expired"):
         return "canceled"
     return "inactive"
+
 
 def _find_plan_by_price_id(price_id: str) -> dict | None:
     try:
@@ -1184,6 +1224,7 @@ def _find_plan_by_price_id(price_id: str) -> dict | None:
         return rows[0] if rows else None
     except Exception:
         return None
+
 
 @app.post("/api/admin/stripe/link-customer")
 @auth_required
@@ -1231,9 +1272,7 @@ def admin_link_stripe_customer():
             stripe_customer_id = custs["data"][0]["id"]
 
         # persist on profile
-        sb_admin.table("user_profiles").update(
-            {"stripe_customer_id": stripe_customer_id}
-        ).eq("user_id", user_id).execute()
+        sb_admin.table("user_profiles").update({"stripe_customer_id": stripe_customer_id}).eq("user_id", user_id).execute()
 
         # fetch subscriptions
         subs = stripe.Subscription.list(
@@ -1259,15 +1298,17 @@ def admin_link_stripe_customer():
 
                 plan = _find_plan_by_price_id(price_id)
                 if not plan:
-                    linked.append({
-                        "subscription_id": sub_id,
-                        "status": sub_status,
-                        "price_id": price_id,
-                        "plan_id": None,
-                        "plan_slug": None,
-                        "period_backfilled": False,
-                        "note": "No plan with matching stripe_price_id"
-                    })
+                    linked.append(
+                        {
+                            "subscription_id": sub_id,
+                            "status": sub_status,
+                            "price_id": price_id,
+                            "plan_id": None,
+                            "plan_slug": None,
+                            "period_backfilled": False,
+                            "note": "No plan with matching stripe_price_id",
+                        }
+                    )
                     continue
 
                 # ensure membership row
@@ -1313,201 +1354,38 @@ def admin_link_stripe_customer():
                         )
 
                     if not existing:
-                        sb_admin.table("membership_periods").insert({
-                            "user_membership_id": mem["id"],
-                            "owner_user_id": mem["owner_user_id"],
-                            "subject_user_id": mem.get("subject_user_id"),
-                            "dependent_id": mem.get("dependent_id"),
-                            "plan_id": mem["plan_id"],
-                            "source": "stripe_backfill",
-                            "source_ref": src_ref,
-                            "period_start": period_start_dt,
-                            "period_end": period_end_dt,
-                        }).execute()
+                        sb_admin.table("membership_periods").insert(
+                            {
+                                "user_membership_id": mem["id"],
+                                "owner_user_id": mem["owner_user_id"],
+                                "subject_user_id": mem.get("subject_user_id"),
+                                "dependent_id": mem.get("dependent_id"),
+                                "plan_id": mem["plan_id"],
+                                "source": "stripe_backfill",
+                                "source_ref": src_ref,
+                                "period_start": period_start_dt,
+                                "period_end": period_end_dt,
+                            }
+                        ).execute()
                         created_period = True
 
-                linked.append({
-                    "subscription_id": sub_id,
-                    "status": sub_status,
-                    "price_id": price_id,
-                    "plan_id": plan["id"],
-                    "plan_slug": plan.get("slug"),
-                    "period_backfilled": created_period,
-                })
+                linked.append(
+                    {
+                        "subscription_id": sub_id,
+                        "status": sub_status,
+                        "price_id": price_id,
+                        "plan_id": plan["id"],
+                        "plan_slug": plan.get("slug"),
+                        "period_backfilled": created_period,
+                    }
+                )
 
-        return jsonify({
-            "ok": True,
-            "customer_id": stripe_customer_id,
-            "linked": linked,
-        })
+        return jsonify({"ok": True, "customer_id": stripe_customer_id, "linked": linked})
 
     except Exception as e:
         log.error(f"[{getattr(g, '_rid', '-')}] link-customer failed: {e}")
         return err(f"link failed: {e}", 500)
 
-# ───────────────────────── QR token endpoints (optional) ───────────
-@app.get("/api/checkins/qr-token")
-@auth_required
-def issue_qr_token():
-    if not CHECKIN_QR_SECRET:
-        return err("QR secret not configured", 500)
-
-    ttl = int(request.args.get("ttl", "300"))  # default 5 minutes
-    ttl = max(60, min(ttl, 3600))              # clamp 1–60 minutes
-    payload = {"uid": g.user_id, "exp": int(time.time()) + ttl}
-
-    body_b64 = _b64url(json.dumps(payload).encode("utf-8"))
-    sig_b64 = _sign_qr_body(body_b64, CHECKIN_QR_SECRET)
-    token = f"{body_b64}.{sig_b64}"
-    return jsonify({"token": token, "expires_at": payload["exp"]})
-
-@app.post("/api/checkins/scan")
-def scan_qr_and_checkin():
-    if not CHECKIN_QR_SECRET:
-        return err("QR secret not configured", 500)
-
-    body = request.get_json(force=True, silent=True) or {}
-    token = body.get("token") or ""
-    location = body.get("location") or "front_desk"
-    source = body.get("source") or f"kiosk:{request.remote_addr}"
-
-    try:
-        body_b64, sig_b64 = token.split(".", 1)
-        expected = _sign_qr_body(body_b64, CHECKIN_QR_SECRET)
-        if not hmac.compare_digest(expected, sig_b64):
-            return err("invalid token signature", 401)
-
-        payload = json.loads(_b64url_decode(body_b64))
-        if int(payload["exp"]) < int(time.time()):
-            return err("token expired", 401)
-
-        user_id = payload["uid"]
-    except Exception as e:
-        return err(f"invalid token: {e}", 401)
-
-    rec = record_checkin(
-        subject_type="user",
-        subject_id=user_id,
-        method="qr",
-        location=location,
-        source=source,
-        meta={"remote_addr": request.remote_addr, "ua": request.headers.get("User-Agent")},
-    )
-
-    prof_rows = (
-        sb_admin.table("user_profiles")
-        .select("first_name,last_name,email")
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-    prof = prof_rows[0] if prof_rows else {}
-    return jsonify({
-        "ok": True,
-        "checkin": rec,
-        "user": {
-            "first_name": prof.get("first_name"),
-            "last_name": prof.get("last_name"),
-            "email": prof.get("email"),
-        },
-    })
-
-# ───────────────────────── dev: seed and stripe ping ───────────────
-def _dev_allowed() -> bool:
-    return request.remote_addr in ("127.0.0.1", "::1") or ENABLE_DEV_ROUTES
-
-@app.post("/dev/seed")
-def dev_seed():
-    if not _dev_allowed():
-        return err("dev routes disabled", 403)
-
-    created = {"plans": None, "waiver": None}
-
-    # Seed plan if table empty OR specific price id missing
-    plans = sb_admin.table("membership_plans").select("id, stripe_price_id").execute().data
-    if not plans:
-        payload = {
-            "name": "Monthly Membership",
-            "description": "Standard monthly access",
-            "price_cents": 3999,
-            "currency": "USD",
-            "interval": "month",
-            "interval_count": 1,
-            "is_active": True,
-            "stripe_price_id": STRIPE_PRICE_ID_MONTHLY,
-        }
-        created["plans"] = sb_admin.table("membership_plans").insert(payload).execute().data
-        log.info(f"seeded membership_plans (new table) {created['plans']}")
-    else:
-        if STRIPE_PRICE_ID_MONTHLY and not any((p.get("stripe_price_id") == STRIPE_PRICE_ID_MONTHLY) for p in plans):
-            payload = {
-                "name": "Monthly Membership",
-                "description": "Standard monthly access",
-                "price_cents": 3999,
-                "currency": "USD",
-                "interval": "month",
-                "interval_count": 1,
-                "is_active": True,
-                "stripe_price_id": STRIPE_PRICE_ID_MONTHLY,
-            }
-            created["plans"] = sb_admin.table("membership_plans").insert(payload).execute().data
-            log.info("seeded membership_plans (added price-based plan)")
-
-    # Seed active waiver if none
-    active = (
-        sb_admin.table("waivers")
-        .select("id")
-        .eq("is_active", True)
-        .eq("required_for_purchase", True)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not active:
-        slug = "general-liability"
-        version = 1
-        title = "General Liability Waiver"
-        body = (
-            "By signing this waiver, I acknowledge the inherent risks of physical exercise and agree to "
-            "release the gym and its employees from any liability arising from my participation."
-        )
-        hashed = hashlib.sha256(f"{slug}:{version}:{title}:{body}".encode("utf-8")).hexdigest()
-        waiver = {
-            "slug": slug,
-            "version": version,
-            "title": title,
-            "body": body,
-            "hash": hashed,
-            "is_active": True,
-            "required_for_purchase": True,
-        }
-        created["waiver"] = sb_admin.table("waivers").insert(waiver).execute().data
-        log.info("seeded active waiver")
-
-    return jsonify({"ok": True, "created": created})
-
-@app.get("/debug/stripe/ping")
-def stripe_ping():
-    if not _dev_allowed():
-        return err("dev routes disabled", 403)
-    if not STRIPE_SECRET_KEY:
-        return err("STRIPE_SECRET_KEY not set", 500)
-
-    try:
-        me = stripe.Account.retrieve()
-        out = {"account": {"id": me.id, "country": me.country}}
-        if STRIPE_PRICE_ID_MONTHLY:
-            price = stripe.Price.retrieve(STRIPE_PRICE_ID_MONTHLY)
-            out["price"] = {
-                "id": price.id,
-                "unit_amount": price.unit_amount,
-                "currency": price.currency,
-                "recurring": price.get("recurring"),
-            }
-        return jsonify(out)
-    except Exception as e:
-        return err(f"stripe ping failed: {e}", 500)
 
 # ───────────────────────── admin: users overview ───────────────────
 @app.get("/api/admin/users/overview")
@@ -1524,8 +1402,8 @@ def admin_users_overview():
           "last_name": "...",
           "last_checkin_at": ISO8601 | null,
           "has_access_now": bool,
-          "waiver_required": bool,              # NEW
-          "waiver_signed": bool | null,         # NEW (null when not required)
+          "waiver_required": bool,
+          "waiver_signed": bool | null,
           "memberships": [{ "id": "...", "status": "...", "plan": {...} | null }]
         }],
         "count": <int>
@@ -1598,7 +1476,7 @@ def admin_users_overview():
                     continue
             return False
 
-        # 5) Latest check-in per subject (ensure dict is always defined)
+        # 5) Latest check-in per subject
         last_checkin_by_subject: Dict[str, str] = {}
         if subject_ids:
             ch = (
@@ -1659,24 +1537,25 @@ def admin_users_overview():
             for m in u_mems:
                 plan = plans_by_id.get(m.get("plan_id"))
                 mems_fmt.append({"id": m["id"], "status": m.get("status"), "plan": plan or None})
-            out_rows.append({
-                "user_id": sid,
-                "email": u.get("email"),
-                "first_name": u.get("first_name"),
-                "last_name": u.get("last_name"),
-                "last_checkin_at": last_checkin_by_subject.get(sid),
-                "has_access_now": active_now(periods_by_subject.get(sid, [])),
-                "waiver_required": waiver_required,
-                "waiver_signed": (sid in signed_subjects) if waiver_required else None,
-                "memberships": mems_fmt,
-            })
+            out_rows.append(
+                {
+                    "user_id": sid,
+                    "email": u.get("email"),
+                    "first_name": u.get("first_name"),
+                    "last_name": u.get("last_name"),
+                    "last_checkin_at": last_checkin_by_subject.get(sid),
+                    "has_access_now": active_now(periods_by_subject.get(sid, [])),
+                    "waiver_required": waiver_required,
+                    "waiver_signed": (sid in signed_subjects) if waiver_required else None,
+                    "memberships": mems_fmt,
+                }
+            )
 
         return jsonify({"users": out_rows, "count": len(out_rows)})
 
     except Exception as e:
         log.error(f"[{rid}] admin/overview failed: {e}")
         return err(f"admin overview failed: {e}", 500)
-
 
 
 # ───────────────────────── user: my check‑ins ──────────────────────
@@ -1704,12 +1583,12 @@ def my_checkins():
         return jsonify({"items": rows, "count": len(rows)})
     except Exception as e:
         return err(f"failed to load check-ins: {e}", 500)
-    
-# Add to app.py
+
+
+# memberships owned by me (for me or my dependents)
 @app.get("/api/memberships/mine/summary")
 @auth_required
 def my_membership_summary():
-    # memberships owned by me (for me or my dependents)
     mems = (
         sb_admin.table("user_memberships")
         .select("id,status,plan_id,subject_user_id,dependent_id")
@@ -1721,13 +1600,7 @@ def my_membership_summary():
         return jsonify({"items": [], "counts_by_plan": [], "count": 0})
 
     plan_ids = {m["plan_id"] for m in mems if m.get("plan_id")}
-    plans = (
-        sb_admin.table("membership_plans")
-        .select("id,name")
-        .in_("id", list(plan_ids))
-        .execute()
-        .data
-    )
+    plans = sb_admin.table("membership_plans").select("id,name").in_("id", list(plan_ids)).execute().data
     plan_by_id = {p["id"]: p for p in plans}
 
     # fetch dependents for labels
@@ -1748,14 +1621,16 @@ def my_membership_summary():
     for m in mems:
         subj_type = "user" if m.get("subject_user_id") else "dependent"
         subj_label = "Me" if subj_type == "user" else dep_map.get(m.get("dependent_id")) or "Dependent"
-        items.append({
-            "id": m["id"],
-            "status": m.get("status"),
-            "plan": {"id": m["plan_id"], "name": plan_by_id.get(m["plan_id"], {}).get("name")},
-            "subject_type": subj_type,
-            "subject_id": m.get("subject_user_id") or m.get("dependent_id"),
-            "subject_label": subj_label,
-        })
+        items.append(
+            {
+                "id": m["id"],
+                "status": m.get("status"),
+                "plan": {"id": m["plan_id"], "name": plan_by_id.get(m["plan_id"], {}).get("name")},
+                "subject_type": subj_type,
+                "subject_id": m.get("subject_user_id") or m.get("dependent_id"),
+                "subject_label": subj_label,
+            }
+        )
 
     # simple counts of active memberships per plan
     counts_map = {}
@@ -1763,11 +1638,13 @@ def my_membership_summary():
         if it["status"] in ("active", "trialing"):  # include trialing as active
             k = it["plan"]["id"]
             counts_map[k] = counts_map.get(k, 0) + 1
-    counts_by_plan = [{"plan_id": pid, "plan_name": plan_by_id.get(pid, {}).get("name"), "count_active": n}
-                      for pid, n in counts_map.items()]
+    counts_by_plan = [
+        {"plan_id": pid, "plan_name": plan_by_id.get(pid, {}).get("name"), "count_active": n} for pid, n in counts_map.items()
+    ]
 
     return jsonify({"items": items, "counts_by_plan": counts_by_plan, "count": len(items)})
-# Add to app.py
+
+
 @app.get("/api/family/dependents")
 @auth_required
 def list_my_dependents():
@@ -1800,7 +1677,9 @@ def list_my_dependents():
             d["is_primary"] = l.get("is_primary")
     items = list(by_id.values())
     return jsonify({"items": items, "count": len(items)})
-# ───────────────────────── admin: recent check-ins feed ──────────────────
+
+
+# ───────────────────────── admin: recent check-ins feed ────────────
 @app.get("/api/admin/checkins/recent")
 @auth_required
 @admin_required
@@ -1812,18 +1691,7 @@ def admin_recent_checkins():
       - since_min (int, optional): only rows from the last N minutes
     Returns:
       {
-        "items": [{
-          "id": "...",
-          "scanned_at": ISO8601,
-          "method": "qr|admin|...",
-          "location": "...",
-          "source": "...",
-          "subject_type": "user" | "dependent",
-          "subject_id": "...",
-          "subject_label": "First Last" | "Dependent Name" | email,
-          "email": "...",  # when available
-          "has_access_now": true|false
-        }],
+        "items": [{ ... }],
         "count": <int>
       }
     """
@@ -1844,7 +1712,7 @@ def admin_recent_checkins():
 
         # Prefetch names/emails
         user_ids = [r["subject_user_id"] for r in rows if r.get("subject_user_id")]
-        dep_ids  = [r["dependent_id"] for r in rows if r.get("dependent_id")]
+        dep_ids = [r["dependent_id"] for r in rows if r.get("dependent_id")]
 
         users_by_id = {}
         if user_ids:
@@ -1877,40 +1745,43 @@ def admin_recent_checkins():
                 label = f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip() or prof.get("email") or "Member"
                 email = prof.get("email")
                 has_now = has_access_now_for_subject(su, None)
-                items.append({
-                    "id": r["id"],
-                    "scanned_at": r["scanned_at"],
-                    "method": r.get("method"),
-                    "location": r.get("location"),
-                    "source": r.get("source"),
-                    "subject_type": "user",
-                    "subject_id": su,
-                    "subject_label": label,
-                    "email": email,
-                    "has_access_now": has_now,
-                })
+                items.append(
+                    {
+                        "id": r["id"],
+                        "scanned_at": r["scanned_at"],
+                        "method": r.get("method"),
+                        "location": r.get("location"),
+                        "source": r.get("source"),
+                        "subject_type": "user",
+                        "subject_id": su,
+                        "subject_label": label,
+                        "email": email,
+                        "has_access_now": has_now,
+                    }
+                )
             else:
                 dep = deps_by_id.get(di, {})
                 label = f"{(dep.get('first_name') or '').strip()} {(dep.get('last_name') or '').strip()}".strip() or "Dependent"
                 email = dep.get("email")
                 has_now = has_access_now_for_subject(None, di)
-                items.append({
-                    "id": r["id"],
-                    "scanned_at": r["scanned_at"],
-                    "method": r.get("method"),
-                    "location": r.get("location"),
-                    "source": r.get("source"),
-                    "subject_type": "dependent",
-                    "subject_id": di,
-                    "subject_label": label,
-                    "email": email,
-                    "has_access_now": has_now,
-                })
+                items.append(
+                    {
+                        "id": r["id"],
+                        "scanned_at": r["scanned_at"],
+                        "method": r.get("method"),
+                        "location": r.get("location"),
+                        "source": r.get("source"),
+                        "subject_type": "dependent",
+                        "subject_id": di,
+                        "subject_label": label,
+                        "email": email,
+                        "has_access_now": has_now,
+                    }
+                )
 
         return jsonify({"items": items, "count": len(items)})
     except Exception as e:
         return err(f"failed to load recent check-ins: {e}", 500)
-
 
 
 # ───────────────────────── run dev server ──────────────────────────
