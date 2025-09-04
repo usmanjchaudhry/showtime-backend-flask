@@ -1056,9 +1056,11 @@ def access_status():
         q = q.eq("dependent_id", subject_id)
     now = datetime.now(timezone.utc)
 
-    rows = q.execute().data
+    rows = q.execute().data or []
     can_enter = any(
-        (datetime.fromisoformat(r["period_start"]) <= now < datetime.fromisoformat(r["period_end"])))
+        datetime.fromisoformat(r["period_start"]) <= now < datetime.fromisoformat(r["period_end"])
+        for r in rows
+    )
     log.info(f"[{g._rid}] access_status subject_type={subject_type} can_enter={can_enter}")
     return jsonify({"subject_type": subject_type, "subject_id": subject_id, "can_enter": can_enter})
 
@@ -1522,6 +1524,8 @@ def admin_users_overview():
           "last_name": "...",
           "last_checkin_at": ISO8601 | null,
           "has_access_now": bool,
+          "waiver_required": bool,              # NEW
+          "waiver_signed": bool | null,         # NEW (null when not required)
           "memberships": [{ "id": "...", "status": "...", "plan": {...} | null }]
         }],
         "count": <int>
@@ -1542,7 +1546,7 @@ def admin_users_overview():
         subject_ids = [u["user_id"] for u in users if u.get("user_id")]
         log.info(f"[{rid}] admin/overview users={len(users)}")
 
-        # 2) Memberships
+        # 2) Memberships (for these users as subjects)
         memberships: List[dict] = []
         if subject_ids:
             memberships = (
@@ -1554,7 +1558,7 @@ def admin_users_overview():
             )
         log.info(f"[{rid}] admin/overview memberships={len(memberships)}")
 
-        # 3) Plans
+        # 3) Plans referenced by those memberships
         plan_ids = {m["plan_id"] for m in memberships if m.get("plan_id")}
         plans_by_id: Dict[str, dict] = {}
         if plan_ids:
@@ -1569,7 +1573,7 @@ def admin_users_overview():
         log.info(f"[{rid}] admin/overview distinct_plans={len(plan_ids)} fetched={len(plans_by_id)}")
 
         # 4) Coverage windows for access
-        periods_by_subject: Dict[str, List[dict]] = {}
+        periods_by_subject: Dict[str, List[dict]] = {sid: [] for sid in subject_ids}
         if subject_ids:
             per_user = (
                 sb_admin.table("membership_periods")
@@ -1594,7 +1598,7 @@ def admin_users_overview():
                     continue
             return False
 
-        # 5) Latest check-in per subject
+        # 5) Latest check-in per subject (ensure dict is always defined)
         last_checkin_by_subject: Dict[str, str] = {}
         if subject_ids:
             ch = (
@@ -1606,11 +1610,42 @@ def admin_users_overview():
                 .data
             )
             for row in ch:
-                sid = row["subject_user_id"]
+                sid = row.get("subject_user_id")
                 if sid and sid not in last_checkin_by_subject:
                     last_checkin_by_subject[sid] = row["scanned_at"]
 
-        # 6) Shape response
+        # 6) Waiver status enrichment (active + required waiver)
+        active_w = (
+            sb_admin.table("waivers")
+            .select("id,version")
+            .eq("is_active", True)
+            .eq("required_for_purchase", True)
+            .limit(1)
+            .execute()
+            .data
+        )
+        waiver_required = bool(active_w)
+        waiver_id = active_w[0]["id"] if waiver_required else None
+        waiver_version = active_w[0]["version"] if waiver_required else None
+
+        signed_subjects: set[str] = set()
+        if waiver_required and subject_ids:
+            sig_rows = (
+                sb_admin.table("waiver_signatures")
+                .select("subject_user_id")
+                .eq("waiver_id", waiver_id)
+                .eq("waiver_version", waiver_version)
+                .is_("revoked_at", "null")
+                .in_("subject_user_id", subject_ids)
+                .execute()
+                .data
+            )
+            for s in sig_rows:
+                sid = s.get("subject_user_id")
+                if sid:
+                    signed_subjects.add(sid)
+
+        # 7) Shape response
         mems_by_subject: Dict[str, List[dict]] = {}
         for m in memberships:
             sid = m["subject_user_id"]
@@ -1631,6 +1666,8 @@ def admin_users_overview():
                 "last_name": u.get("last_name"),
                 "last_checkin_at": last_checkin_by_subject.get(sid),
                 "has_access_now": active_now(periods_by_subject.get(sid, [])),
+                "waiver_required": waiver_required,
+                "waiver_signed": (sid in signed_subjects) if waiver_required else None,
                 "memberships": mems_fmt,
             })
 
@@ -1639,6 +1676,8 @@ def admin_users_overview():
     except Exception as e:
         log.error(f"[{rid}] admin/overview failed: {e}")
         return err(f"admin overview failed: {e}", 500)
+
+
 
 # ───────────────────────── user: my check‑ins ──────────────────────
 @app.get("/api/checkins/mine")
@@ -1665,6 +1704,214 @@ def my_checkins():
         return jsonify({"items": rows, "count": len(rows)})
     except Exception as e:
         return err(f"failed to load check-ins: {e}", 500)
+    
+# Add to app.py
+@app.get("/api/memberships/mine/summary")
+@auth_required
+def my_membership_summary():
+    # memberships owned by me (for me or my dependents)
+    mems = (
+        sb_admin.table("user_memberships")
+        .select("id,status,plan_id,subject_user_id,dependent_id")
+        .eq("owner_user_id", g.user_id)
+        .execute()
+        .data
+    )
+    if not mems:
+        return jsonify({"items": [], "counts_by_plan": [], "count": 0})
+
+    plan_ids = {m["plan_id"] for m in mems if m.get("plan_id")}
+    plans = (
+        sb_admin.table("membership_plans")
+        .select("id,name")
+        .in_("id", list(plan_ids))
+        .execute()
+        .data
+    )
+    plan_by_id = {p["id"]: p for p in plans}
+
+    # fetch dependents for labels
+    dep_ids = [m["dependent_id"] for m in mems if m.get("dependent_id")]
+    dep_map = {}
+    if dep_ids:
+        deps = (
+            sb_admin.table("dependents")
+            .select("id,first_name,last_name")
+            .in_("id", dep_ids)
+            .execute()
+            .data
+        )
+        dep_map = {d["id"]: f"{d.get('first_name','')} {d.get('last_name','')}".strip() for d in deps}
+
+    # shape items (+ human label)
+    items = []
+    for m in mems:
+        subj_type = "user" if m.get("subject_user_id") else "dependent"
+        subj_label = "Me" if subj_type == "user" else dep_map.get(m.get("dependent_id")) or "Dependent"
+        items.append({
+            "id": m["id"],
+            "status": m.get("status"),
+            "plan": {"id": m["plan_id"], "name": plan_by_id.get(m["plan_id"], {}).get("name")},
+            "subject_type": subj_type,
+            "subject_id": m.get("subject_user_id") or m.get("dependent_id"),
+            "subject_label": subj_label,
+        })
+
+    # simple counts of active memberships per plan
+    counts_map = {}
+    for it in items:
+        if it["status"] in ("active", "trialing"):  # include trialing as active
+            k = it["plan"]["id"]
+            counts_map[k] = counts_map.get(k, 0) + 1
+    counts_by_plan = [{"plan_id": pid, "plan_name": plan_by_id.get(pid, {}).get("name"), "count_active": n}
+                      for pid, n in counts_map.items()]
+
+    return jsonify({"items": items, "counts_by_plan": counts_by_plan, "count": len(items)})
+# Add to app.py
+@app.get("/api/family/dependents")
+@auth_required
+def list_my_dependents():
+    # fetch dependents linked to current user through guardian_links
+    links = (
+        sb_admin.table("guardian_links")
+        .select("dependent_id,relationship,is_primary")
+        .eq("guardian_user_id", g.user_id)
+        .execute()
+        .data
+    )
+    dep_ids = [l["dependent_id"] for l in links]
+    if not dep_ids:
+        return jsonify({"items": [], "count": 0})
+
+    deps = (
+        sb_admin.table("dependents")
+        .select("id,first_name,last_name,date_of_birth,email")
+        .in_("id", dep_ids)
+        .order("first_name", desc=False)
+        .execute()
+        .data
+    )
+    # Attach link info (optional)
+    by_id = {d["id"]: d for d in deps}
+    for l in links:
+        d = by_id.get(l["dependent_id"])
+        if d:
+            d["relationship"] = l.get("relationship")
+            d["is_primary"] = l.get("is_primary")
+    items = list(by_id.values())
+    return jsonify({"items": items, "count": len(items)})
+# ───────────────────────── admin: recent check-ins feed ──────────────────
+@app.get("/api/admin/checkins/recent")
+@auth_required
+@admin_required
+def admin_recent_checkins():
+    """
+    Admin-only feed of recent check-ins.
+    Query params:
+      - limit (int, default 50, max 200)
+      - since_min (int, optional): only rows from the last N minutes
+    Returns:
+      {
+        "items": [{
+          "id": "...",
+          "scanned_at": ISO8601,
+          "method": "qr|admin|...",
+          "location": "...",
+          "source": "...",
+          "subject_type": "user" | "dependent",
+          "subject_id": "...",
+          "subject_label": "First Last" | "Dependent Name" | email,
+          "email": "...",  # when available
+          "has_access_now": true|false
+        }],
+        "count": <int>
+      }
+    """
+    try:
+        limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+        since_min = int(request.args.get("since_min", "0"))
+        q = (
+            sb_admin.table("gym_checkins")
+            .select("id,subject_user_id,dependent_id,scanned_at,method,location,source,meta")
+            .order("scanned_at", desc=True)
+            .limit(limit)
+        )
+        if since_min > 0:
+            since_dt = datetime.now(timezone.utc) - timedelta(minutes=since_min)
+            q = q.gte("scanned_at", since_dt.isoformat())
+
+        rows = q.execute().data or []
+
+        # Prefetch names/emails
+        user_ids = [r["subject_user_id"] for r in rows if r.get("subject_user_id")]
+        dep_ids  = [r["dependent_id"] for r in rows if r.get("dependent_id")]
+
+        users_by_id = {}
+        if user_ids:
+            ups = (
+                sb_admin.table("user_profiles")
+                .select("user_id,first_name,last_name,email")
+                .in_("user_id", user_ids)
+                .execute()
+                .data
+            ) or []
+            users_by_id = {u["user_id"]: u for u in ups}
+
+        deps_by_id = {}
+        if dep_ids:
+            dps = (
+                sb_admin.table("dependents")
+                .select("id,first_name,last_name,email")
+                .in_("id", dep_ids)
+                .execute()
+                .data
+            ) or []
+            deps_by_id = {d["id"]: d for d in dps}
+
+        items = []
+        for r in rows:
+            su = r.get("subject_user_id")
+            di = r.get("dependent_id")
+            if su:
+                prof = users_by_id.get(su, {})
+                label = f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip() or prof.get("email") or "Member"
+                email = prof.get("email")
+                has_now = has_access_now_for_subject(su, None)
+                items.append({
+                    "id": r["id"],
+                    "scanned_at": r["scanned_at"],
+                    "method": r.get("method"),
+                    "location": r.get("location"),
+                    "source": r.get("source"),
+                    "subject_type": "user",
+                    "subject_id": su,
+                    "subject_label": label,
+                    "email": email,
+                    "has_access_now": has_now,
+                })
+            else:
+                dep = deps_by_id.get(di, {})
+                label = f"{(dep.get('first_name') or '').strip()} {(dep.get('last_name') or '').strip()}".strip() or "Dependent"
+                email = dep.get("email")
+                has_now = has_access_now_for_subject(None, di)
+                items.append({
+                    "id": r["id"],
+                    "scanned_at": r["scanned_at"],
+                    "method": r.get("method"),
+                    "location": r.get("location"),
+                    "source": r.get("source"),
+                    "subject_type": "dependent",
+                    "subject_id": di,
+                    "subject_label": label,
+                    "email": email,
+                    "has_access_now": has_now,
+                })
+
+        return jsonify({"items": items, "count": len(items)})
+    except Exception as e:
+        return err(f"failed to load recent check-ins: {e}", 500)
+
+
 
 # ───────────────────────── run dev server ──────────────────────────
 if __name__ == "__main__":
