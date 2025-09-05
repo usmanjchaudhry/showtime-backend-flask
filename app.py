@@ -755,6 +755,73 @@ def waiver_sign():
             pass
 
     return jsonify(sig), 201
+# ───────────────────────── checkout: session info ──────────────────
+@app.get("/api/checkout/session-info")
+@auth_required
+def checkout_session_info():
+    """
+    Return a minimal, auth-checked summary about a Stripe Checkout Session so
+    the frontend can show 'what you just bought'.
+    Query: ?session_id=cs_...
+    """
+    sid = (request.args.get("session_id") or "").strip()
+    if not sid:
+        return err("session_id required", 400)
+
+    try:
+        sess = stripe.checkout.Session.retrieve(sid)
+    except Exception as e:
+        return err(f"invalid session_id: {e}", 400)
+
+    # Verify the session belongs to the caller using metadata we set at creation.
+    md = (sess.get("metadata") or {}) if isinstance(sess, dict) else getattr(sess, "metadata", {}) or {}
+    owner_user_id = md.get("owner_user_id")
+    if owner_user_id and owner_user_id != g.user_id:
+        return err("forbidden", 403)
+
+    plan_id = md.get("plan_id")
+    plan = None
+    if plan_id:
+        rows = (
+            sb_admin.table("membership_plans")
+            .select("id,name,price_cents,currency,interval,interval_count")
+            .eq("id", plan_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        plan = rows[0] if rows else None
+
+    # Subject label
+    subj_type = "user"
+    subj_id = md.get("subject_user_id") or None
+    if not subj_id:
+        subj_type = "dependent"
+        subj_id = md.get("dependent_id")
+    subject_label = "Me"
+    if subj_type == "dependent" and subj_id:
+        dep_rows = (
+            sb_admin.table("dependents")
+            .select("first_name,last_name")
+            .eq("id", subj_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if dep_rows:
+            fn = (dep_rows[0].get("first_name") or "").strip()
+            ln = (dep_rows[0].get("last_name") or "").strip()
+            subject_label = (fn + " " + ln).strip() or "Dependent"
+
+    out = {
+        "mode": sess.get("mode"),
+        "status": sess.get("status"),
+        "amount_total": sess.get("amount_total"),
+        "currency": (sess.get("currency") or "usd").upper(),
+        "plan": plan,  # may be None if plan couldn’t be looked up
+        "subject": {"type": subj_type, "id": subj_id, "label": subject_label},
+    }
+    return jsonify(out)
 
 
 # ───────────────────────── checkout/session ────────────────────────
@@ -828,8 +895,8 @@ def create_checkout_session():
                 mode="subscription",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"{FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{FRONTEND_URL}/billing/cancel",
+                success_url=f"http://localhost:5173//billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"http://localhost:5173//billing/cancel",
                 metadata=md,
                 subscription_data={"metadata": md},
             )
@@ -838,8 +905,8 @@ def create_checkout_session():
                 mode="payment",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"{FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{FRONTEND_URL}/billing/cancel",
+                success_url=f"http://localhost:5173//billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"http://localhost:5173//billing/cancel",
                 metadata=md,
             )
         log.info(f"[{rid}] /api/checkout/session created id={sess.id}")
