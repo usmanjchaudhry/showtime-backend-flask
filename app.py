@@ -4,6 +4,8 @@ import json
 import logging
 import traceback
 import calendar
+import hmac
+import hashlib
 from uuid import uuid4
 from time import perf_counter
 from datetime import datetime, timezone, timedelta
@@ -41,6 +43,12 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 WAIVER_BUCKET = os.getenv("WAIVER_BUCKET", "waivers")
 
 stripe.api_key = STRIPE_SECRET_KEY
+# Secret for QR token signing
+CHECKIN_QR_SECRET = os.getenv("CHECKIN_QR_SECRET")
+if not CHECKIN_QR_SECRET:
+    logging.getLogger("api").warning("CHECKIN_QR_SECRET not set; using weak dev secret")
+    CHECKIN_QR_SECRET = "dev-qr-secret"
+
 
 # Supabase admin + public clients
 sb_admin: Client = create_client(
@@ -178,6 +186,32 @@ def ensure_bucket(name: str):
     except Exception as e:
         app.logger.warning(f"[storage] ensure bucket failed: {e}")
 
+# ───────────────────────── check-ins: QR token ─────────────────────
+def _sign_qr_token(user_id: str, exp_ts: int) -> str:
+    """
+    Create a compact token: base64url("user.exp.sig")
+    where sig = HMAC-SHA256(key=CHECKIN_QR_SECRET, msg="user.exp").
+    """
+    msg = f"{user_id}.{exp_ts}".encode("utf-8")
+    sig = hmac.new(CHECKIN_QR_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    raw = f"{user_id}.{exp_ts}.{sig}".encode("utf-8")
+    import base64  # (already imported at top, fine if duplicated here)
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+@app.get("/api/checkins/qr-token")
+@auth_required    # keep auth on GET; DO NOT add OPTIONS here
+def get_qr_token():
+    # ttl query param (seconds); clamp to a safe range
+    try:
+        ttl = int(request.args.get("ttl", "300"))
+    except Exception:
+        ttl = 300
+    ttl = max(30, min(ttl, 1800))  # 30s .. 30min
+
+    exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=ttl)).timestamp())
+    token = _sign_qr_token(g.user_id, exp_ts)
+    return jsonify({"token": token, "expires_at": exp_ts})
 
 def parse_data_url_png(data_url: str) -> bytes:
     if not data_url or not data_url.startswith("data:image"):
