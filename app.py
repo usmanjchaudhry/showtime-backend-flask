@@ -71,7 +71,7 @@ log = logging.getLogger("api")
 
 # ────────────────────────── flask + cors ───────────────────────────
 app = Flask(__name__)
-CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
+CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173",    "https://showtime-front-end.vercel.app"]
 CORS(
     app,
     resources={r"/(signup|login|api/.*|ping)": {"origins": CORS_ORIGINS}},
