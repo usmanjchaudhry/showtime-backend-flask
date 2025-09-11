@@ -895,8 +895,8 @@ def create_checkout_session():
                 mode="subscription",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"http://localhost:5173//billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"http://localhost:5173//billing/cancel",
+                success_url=f"http://localhost:5173/memberships?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"http://localhost:5173/memberships",
                 metadata=md,
                 subscription_data={"metadata": md},
             )
@@ -905,8 +905,8 @@ def create_checkout_session():
                 mode="payment",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"http://localhost:5173//billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"http://localhost:5173//billing/cancel",
+                success_url=f"http://localhost:5173/memberships?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"http://localhost:5173/memberships",
                 metadata=md,
             )
         log.info(f"[{rid}] /api/checkout/session created id={sess.id}")
