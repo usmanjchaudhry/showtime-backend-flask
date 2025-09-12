@@ -1,4 +1,4 @@
-# app.py (waiver-gated checkout + subscriptions + one-time + admin link/backfill)
+# app.py — waiver‑gated checkout + subscriptions + one‑time + admin link/backfill
 import os
 import json
 import logging
@@ -39,16 +39,16 @@ ANON_KEY = os.getenv("SUPABASE_ANON")
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 WAIVER_BUCKET = os.getenv("WAIVER_BUCKET", "waivers")
 
 stripe.api_key = STRIPE_SECRET_KEY
+
 # Secret for QR token signing
 CHECKIN_QR_SECRET = os.getenv("CHECKIN_QR_SECRET")
 if not CHECKIN_QR_SECRET:
     logging.getLogger("api").warning("CHECKIN_QR_SECRET not set; using weak dev secret")
     CHECKIN_QR_SECRET = "dev-qr-secret"
-
 
 # Supabase admin + public clients
 sb_admin: Client = create_client(
@@ -71,12 +71,12 @@ log = logging.getLogger("api")
 
 # ────────────────────────── flask + cors ───────────────────────────
 app = Flask(__name__)
-CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173",    "https://showtime-front-end.vercel.app"]
+CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173", "https://showtime-front-end.vercel.app","https://www.showtimeboxinggym.com" FRONTEND_URL]
 CORS(
     app,
-    resources={r"/(signup|login|api/.*|ping)": {"origins": CORS_ORIGINS}},
+    resources={r"/(signup|login|api/.*|ping|webhooks/.*)": {"origins": CORS_ORIGINS}},
     supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "x-request-id"],
+    allow_headers=["Content-Type", "Authorization", "x-request-id", "Stripe-Signature"],
     expose_headers=["x-request-id"],
 )
 
@@ -147,7 +147,6 @@ def auth_required(fn):
         except Exception as e:
             return err(f"invalid token: {e}", 401)
         return fn(*args, **kwargs)
-
     return wrapper
 
 
@@ -172,7 +171,6 @@ def admin_required(fn):
         if not is_admin:
             return err("forbidden", 403)
         return fn(*args, **kwargs)
-
     return wrapper
 
 
@@ -186,6 +184,14 @@ def ensure_bucket(name: str):
     except Exception as e:
         app.logger.warning(f"[storage] ensure bucket failed: {e}")
 
+
+def _parse_ts(s: str) -> datetime:
+    """Tolerant ISO8601 parser (supports trailing 'Z')."""
+    if isinstance(s, datetime):
+        return s
+    return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+
+
 # ───────────────────────── check-ins: QR token ─────────────────────
 def _sign_qr_token(user_id: str, exp_ts: int) -> str:
     """
@@ -195,12 +201,11 @@ def _sign_qr_token(user_id: str, exp_ts: int) -> str:
     msg = f"{user_id}.{exp_ts}".encode("utf-8")
     sig = hmac.new(CHECKIN_QR_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     raw = f"{user_id}.{exp_ts}.{sig}".encode("utf-8")
-    import base64  # (already imported at top, fine if duplicated here)
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
 
 @app.get("/api/checkins/qr-token")
-@auth_required    # keep auth on GET; DO NOT add OPTIONS here
+@auth_required
 def get_qr_token():
     # ttl query param (seconds); clamp to a safe range
     try:
@@ -212,6 +217,7 @@ def get_qr_token():
     exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=ttl)).timestamp())
     token = _sign_qr_token(g.user_id, exp_ts)
     return jsonify({"token": token, "expires_at": exp_ts})
+
 
 def parse_data_url_png(data_url: str) -> bytes:
     if not data_url or not data_url.startswith("data:image"):
@@ -280,7 +286,7 @@ def build_waiver_pdf(waiver, full_name, dob_str, signed_at_dt, ip, ua, sig_png_b
 
 
 def to_utc_ts(sec: int) -> datetime:
-    return datetime.fromtimestamp(sec, tz=timezone.utc)
+    return datetime.fromtimestamp(int(sec), tz=timezone.utc)
 
 
 def add_interval(dt: datetime, interval: str, count: int) -> datetime:
@@ -460,8 +466,8 @@ def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | 
     rows = q.execute().data
     for r in rows:
         try:
-            ps = datetime.fromisoformat(r["period_start"])
-            pe = datetime.fromisoformat(r["period_end"])
+            ps = _parse_ts(r["period_start"])
+            pe = _parse_ts(r["period_end"])
             if ps <= now < pe:
                 return True
         except Exception:
@@ -755,6 +761,8 @@ def waiver_sign():
             pass
 
     return jsonify(sig), 201
+
+
 # ───────────────────────── checkout: session info ──────────────────
 @app.get("/api/checkout/session-info")
 @auth_required
@@ -884,6 +892,11 @@ def create_checkout_session():
         "subject_user_id": g.user_id if subject_type == "user" else "",
         "dependent_id": subject_id if subject_type == "dependent" else "",
     }
+
+    base = FRONTEND_URL or "http://localhost:5173"
+    success_url = f"{base}/memberships?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{base}/memberships"
+
     log.info(
         f"[{rid}] /api/checkout/session creating stripe session mode={checkout_mode} "
         f"customer={customer_id} price={price_id} plan={plan['id']} subject_id={subject_id}"
@@ -895,8 +908,8 @@ def create_checkout_session():
                 mode="subscription",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"http://localhost:5173/memberships?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"http://localhost:5173/memberships",
+                success_url=success_url,
+                cancel_url=cancel_url,
                 metadata=md,
                 subscription_data={"metadata": md},
             )
@@ -905,8 +918,8 @@ def create_checkout_session():
                 mode="payment",
                 line_items=[{"price": price_id, "quantity": 1}],
                 customer=customer_id,
-                success_url=f"http://localhost:5173/memberships?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"http://localhost:5173/memberships",
+                success_url=success_url,
+                cancel_url=cancel_url,
                 metadata=md,
             )
         log.info(f"[{rid}] /api/checkout/session created id={sess.id}")
@@ -1047,7 +1060,9 @@ def stripe_webhook():
             sub_id = sess.get("subscription")
             if not (plan_id and owner_user_id and sub_id and customer_id):
                 return jsonify({"ok": True})
-            ensure_membership(
+
+            # Ensure membership row and seed current period immediately (idempotent)
+            mem = ensure_membership(
                 owner_user_id=owner_user_id,
                 plan_id=plan_id,
                 subject_user_id=subject_user_id,
@@ -1056,6 +1071,37 @@ def stripe_webhook():
                 provider_subscription_id=sub_id,
                 status="active",
             )
+
+            try:
+                sub = stripe.Subscription.retrieve(sub_id)
+                start_ts = sub.get("current_period_start")
+                end_ts = sub.get("current_period_end")
+                if start_ts and end_ts:
+                    src_ref = f"{sub_id}:{start_ts}"
+                    exists = (
+                        sb_admin.table("membership_periods")
+                        .select("id")
+                        .eq("source", "stripe")
+                        .eq("source_ref", src_ref)
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if not exists:
+                        sb_admin.table("membership_periods").insert({
+                            "user_membership_id": mem["id"],
+                            "owner_user_id": mem["owner_user_id"],
+                            "subject_user_id": mem.get("subject_user_id"),
+                            "dependent_id": mem.get("dependent_id"),
+                            "plan_id": mem["plan_id"],
+                            "source": "stripe",
+                            "source_ref": src_ref,
+                            "period_start": to_utc_ts(int(start_ts)),
+                            "period_end": to_utc_ts(int(end_ts)),
+                        }).execute()
+            except Exception as e:
+                log.warning(f"could not seed period from subscription: {e}")
+
             return jsonify({"ok": True})
 
         # One-time payment: grant access period
@@ -1195,9 +1241,7 @@ def access_status():
     now = datetime.now(timezone.utc)
 
     rows = q.execute().data or []
-    can_enter = any(
-        datetime.fromisoformat(r["period_start"]) <= now < datetime.fromisoformat(r["period_end"]) for r in rows
-    )
+    can_enter = any(_parse_ts(r["period_start"]) <= now < _parse_ts(r["period_end"]) for r in rows)
     log.info(f"[{g._rid}] access_status subject_type={subject_type} can_enter={can_enter}")
     return jsonify({"subject_type": subject_type, "subject_id": subject_id, "can_enter": can_enter})
 
@@ -1423,7 +1467,7 @@ def admin_link_stripe_customer():
                     status=mapped_status,
                 )
 
-                # backfill current period (idempotent)
+                # backfill current period (idempotent) — use source="stripe" to satisfy DB check constraint
                 created_period = False
                 start_ts = s.get("current_period_start")
                 end_ts = s.get("current_period_end")
@@ -1436,7 +1480,7 @@ def admin_link_stripe_customer():
                         sb_admin.table("membership_periods")
                         .select("id")
                         .eq("user_membership_id", mem["id"])
-                        .eq("source", "stripe_backfill")
+                        .eq("source", "stripe")
                         .eq("source_ref", src_ref)
                         .limit(1)
                         .execute()
@@ -1462,7 +1506,7 @@ def admin_link_stripe_customer():
                                 "subject_user_id": mem.get("subject_user_id"),
                                 "dependent_id": mem.get("dependent_id"),
                                 "plan_id": mem["plan_id"],
-                                "source": "stripe_backfill",
+                                "source": "stripe",
                                 "source_ref": src_ref,
                                 "period_start": period_start_dt,
                                 "period_end": period_end_dt,
@@ -1514,7 +1558,7 @@ def admin_users_overview():
     now = datetime.now(timezone.utc)
 
     try:
-        # 1) Users
+        # 1) Users (owners)
         users: List[dict] = (
             sb_admin.table("user_profiles")
             .select("user_id,email,first_name,last_name")
@@ -1522,16 +1566,16 @@ def admin_users_overview():
             .execute()
             .data
         )
-        subject_ids = [u["user_id"] for u in users if u.get("user_id")]
+        owner_ids = [u["user_id"] for u in users if u.get("user_id")]
         log.info(f"[{rid}] admin/overview users={len(users)}")
 
-        # 2) Memberships (for these users as subjects)
+        # 2) Memberships (owned by these users)  ← owner-centric
         memberships: List[dict] = []
-        if subject_ids:
+        if owner_ids:
             memberships = (
                 sb_admin.table("user_memberships")
-                .select("id,owner_user_id,subject_user_id,plan_id,status")
-                .in_("subject_user_id", subject_ids)
+                .select("id,owner_user_id,subject_user_id,dependent_id,plan_id,status")
+                .in_("owner_user_id", owner_ids)
                 .execute()
                 .data
             )
@@ -1551,39 +1595,39 @@ def admin_users_overview():
             plans_by_id = {p["id"]: p for p in plans}
         log.info(f"[{rid}] admin/overview distinct_plans={len(plan_ids)} fetched={len(plans_by_id)}")
 
-        # 4) Coverage windows for access
-        periods_by_subject: Dict[str, List[dict]] = {sid: [] for sid in subject_ids}
-        if subject_ids:
-            per_user = (
+        # 4) Coverage windows for access ← compute by owner_user_id
+        periods_by_owner: Dict[str, List[dict]] = {oid: [] for oid in owner_ids}
+        if owner_ids:
+            per_owner = (
                 sb_admin.table("membership_periods")
-                .select("subject_user_id,period_start,period_end,is_voided")
-                .in_("subject_user_id", subject_ids)
+                .select("owner_user_id,period_start,period_end,is_voided")
+                .in_("owner_user_id", owner_ids)
                 .eq("is_voided", False)
                 .execute()
                 .data
             )
-            for r in per_user:
-                sid = r["subject_user_id"]
-                periods_by_subject.setdefault(sid, []).append(r)
+            for r in per_owner:
+                oid = r["owner_user_id"]
+                periods_by_owner.setdefault(oid, []).append(r)
 
         def active_now(periods: List[dict]) -> bool:
             for pr in periods or []:
                 try:
-                    ps = datetime.fromisoformat(pr["period_start"])
-                    pe = datetime.fromisoformat(pr["period_end"])
+                    ps = _parse_ts(pr["period_start"])
+                    pe = _parse_ts(pr["period_end"])
                     if ps <= now < pe:
                         return True
                 except Exception:
                     continue
             return False
 
-        # 5) Latest check-in per subject
+        # 5) Latest check-in per (user as subject) — unchanged
         last_checkin_by_subject: Dict[str, str] = {}
-        if subject_ids:
+        if owner_ids:
             ch = (
                 sb_admin.table("gym_checkins")
                 .select("subject_user_id,scanned_at")
-                .in_("subject_user_id", subject_ids)
+                .in_("subject_user_id", owner_ids)
                 .order("scanned_at", desc=True)
                 .execute()
                 .data
@@ -1593,7 +1637,7 @@ def admin_users_overview():
                 if sid and sid not in last_checkin_by_subject:
                     last_checkin_by_subject[sid] = row["scanned_at"]
 
-        # 6) Waiver status enrichment (active + required waiver)
+        # 6) Waiver requirement + signatures for these users (as subjects)
         active_w = (
             sb_admin.table("waivers")
             .select("id,version")
@@ -1608,14 +1652,14 @@ def admin_users_overview():
         waiver_version = active_w[0]["version"] if waiver_required else None
 
         signed_subjects: set[str] = set()
-        if waiver_required and subject_ids:
+        if waiver_required and owner_ids:
             sig_rows = (
                 sb_admin.table("waiver_signatures")
                 .select("subject_user_id")
                 .eq("waiver_id", waiver_id)
                 .eq("waiver_version", waiver_version)
                 .is_("revoked_at", "null")
-                .in_("subject_user_id", subject_ids)
+                .in_("subject_user_id", owner_ids)
                 .execute()
                 .data
             )
@@ -1624,30 +1668,31 @@ def admin_users_overview():
                 if sid:
                     signed_subjects.add(sid)
 
-        # 7) Shape response
-        mems_by_subject: Dict[str, List[dict]] = {}
+        # 7) Shape response by owner
+        mems_by_owner: Dict[str, List[dict]] = {}
         for m in memberships:
-            sid = m["subject_user_id"]
-            mems_by_subject.setdefault(sid, []).append(m)
+            oid = m["owner_user_id"]
+            mems_by_owner.setdefault(oid, []).append(m)
 
         out_rows = []
         for u in users:
-            sid = u["user_id"]
-            u_mems = mems_by_subject.get(sid, [])
+            oid = u["user_id"]
+            u_mems = mems_by_owner.get(oid, [])
             mems_fmt = []
             for m in u_mems:
                 plan = plans_by_id.get(m.get("plan_id"))
                 mems_fmt.append({"id": m["id"], "status": m.get("status"), "plan": plan or None})
+
             out_rows.append(
                 {
-                    "user_id": sid,
+                    "user_id": oid,
                     "email": u.get("email"),
                     "first_name": u.get("first_name"),
                     "last_name": u.get("last_name"),
-                    "last_checkin_at": last_checkin_by_subject.get(sid),
-                    "has_access_now": active_now(periods_by_subject.get(sid, [])),
+                    "last_checkin_at": last_checkin_by_subject.get(oid),
+                    "has_access_now": active_now(periods_by_owner.get(oid, [])),
                     "waiver_required": waiver_required,
-                    "waiver_signed": (sid in signed_subjects) if waiver_required else None,
+                    "waiver_signed": (oid in signed_subjects) if waiver_required else None,
                     "memberships": mems_fmt,
                 }
             )
@@ -1885,7 +1930,7 @@ def admin_recent_checkins():
         return err(f"failed to load recent check-ins: {e}", 500)
 
 
-# ───────────────────────── run dev server ──────────────────────────
+# ───────────────────────── run server ──────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     log.info(f"Starting server on 0.0.0.0:{port}  FRONTEND_URL={FRONTEND_URL}")
