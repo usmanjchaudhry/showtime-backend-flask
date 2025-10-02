@@ -107,8 +107,15 @@ def _log_request_start():
 @app.after_request
 def _log_response(resp):
     dur_ms = (perf_counter() - g.get("_start", perf_counter())) * 1000
-    log.info(f"[{g.get('_rid','-')}] ← {resp.status_code} {resp.content_type} {dur_ms:.1f}ms")
+    rid = g.get("_rid", "-")
+    log.info(f"[{rid}] ← {resp.status_code} {resp.content_type} {dur_ms:.1f}ms")
+    # Attach request id so the frontend can surface it
+    try:
+        resp.headers["x-request-id"] = rid
+    except Exception:
+        pass
     return resp
+
 
 
 @app.errorhandler(Exception)
@@ -191,6 +198,14 @@ def _parse_ts(s: str) -> datetime:
         return s
     return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
 
+# ───────── NEW: base64url helper that tolerates missing padding ─────────
+def _urlsafe_b64decode(s: str) -> bytes:
+    s = (s or "").strip()
+    if not s:
+        return b""
+    # add required '=' padding
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
 
 # ───────────────────────── check-ins: QR token ─────────────────────
 def _sign_qr_token(user_id: str, exp_ts: int) -> str:
@@ -203,6 +218,66 @@ def _sign_qr_token(user_id: str, exp_ts: int) -> str:
     raw = f"{user_id}.{exp_ts}.{sig}".encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
+# ───────── NEW: verify token accepting several historical shapes ─────────
+def _verify_qr_token(token: str) -> tuple[str, int]:
+    """
+    Accepts tokens in any of these shapes and returns (user_id, exp_ts):
+      A) base64url("user_id.exp.sigHex")           ← current minted format
+      B) "user_id.exp.sigHex"                      ← raw dotted form
+      C) base64(user_id).base64(exp or .exp.).base64(sigHex)  ← legacy 3-part
+    Raises ValueError on failure.
+    """
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    def _validate(user_id: str, exp_str: str, sig_hex: str):
+        if not user_id or not exp_str or not sig_hex:
+            raise ValueError("malformed token")
+        try:
+            exp = int(str(exp_str).strip().strip("."))
+        except Exception:
+            raise ValueError("invalid expiry")
+        msg = f"{user_id}.{exp}".encode("utf-8")
+        expected = hmac.new(CHECKIN_QR_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+        # use constant-time comparison
+        if not hmac.compare_digest(expected, sig_hex):
+            raise ValueError("bad signature")
+        if exp < now:
+            raise ValueError("token expired")
+        return user_id, exp
+
+    tok = (token or "").strip()
+
+    # 1) Attempt full base64url of "user.exp.sigHex"
+    try:
+        raw = _urlsafe_b64decode(tok).decode("utf-8")
+        parts = raw.split(".", 2)
+        if len(parts) == 3:
+            return _validate(parts[0], parts[1], parts[2])
+    except Exception:
+        pass
+
+    # 2) Attempt legacy three-part base64(user).base64(exp-ish).base64(sig)
+    if tok.count(".") >= 2:
+        p = tok.split(".")
+        # try first three segments only
+        try:
+            u = _urlsafe_b64decode(p[0]).decode("utf-8")
+            mid = _urlsafe_b64decode(p[1]).decode("utf-8")  # might be ".12345." or "12345"
+            s = _urlsafe_b64decode(p[2]).decode("utf-8")
+            return _validate(u, mid, s)
+        except Exception:
+            # fallthrough
+            pass
+
+    # 3) Attempt raw "user.exp.sigHex"
+    if tok.count(".") >= 2:
+        try:
+            parts = tok.split(".", 2)
+            return _validate(parts[0], parts[1], parts[2])
+        except Exception:
+            pass
+
+    raise ValueError("invalid token")
 
 @app.get("/api/checkins/qr-token")
 @auth_required
@@ -218,13 +293,11 @@ def get_qr_token():
     token = _sign_qr_token(g.user_id, exp_ts)
     return jsonify({"token": token, "expires_at": exp_ts})
 
-
 def parse_data_url_png(data_url: str) -> bytes:
     if not data_url or not data_url.startswith("data:image"):
         return b""
     header, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
-
 
 def build_waiver_pdf(waiver, full_name, dob_str, signed_at_dt, ip, ua, sig_png_bytes: bytes) -> bytes:
     buf = io.BytesIO()
@@ -284,10 +357,8 @@ def build_waiver_pdf(waiver, full_name, dob_str, signed_at_dt, ip, ua, sig_png_b
     buf.seek(0)
     return buf.read()
 
-
 def to_utc_ts(sec: int) -> datetime:
     return datetime.fromtimestamp(int(sec), tz=timezone.utc)
-
 
 def add_interval(dt: datetime, interval: str, count: int) -> datetime:
     """Add a plan interval to a datetime (supports day/week/month/year)."""
@@ -309,7 +380,6 @@ def add_interval(dt: datetime, interval: str, count: int) -> datetime:
         except ValueError:
             return dt.replace(month=2, day=28, year=dt.year + count)
     return dt + timedelta(days=count)
-
 
 def get_or_create_stripe_customer(user_id: str) -> str:
     prof = (
@@ -338,7 +408,6 @@ def get_or_create_stripe_customer(user_id: str) -> str:
     sb_admin.table("user_profiles").update({"stripe_customer_id": cid}).eq("user_id", user_id).execute()
     log.info(f"[{g._rid}] created stripe customer {cid} for user {user_id}")
     return cid
-
 
 def ensure_membership(
     owner_user_id: str,
@@ -413,7 +482,6 @@ def ensure_membership(
     log.info(f"[{g._rid}] created membership {mem['id']} payload={payload}")
     return mem
 
-
 def has_signed_required_waiver(subject_type: str, subject_id: str) -> bool:
     """Return True if there's no required waiver OR the subject signed the current version."""
     rid = getattr(g, "_rid", "-")
@@ -454,7 +522,6 @@ def has_signed_required_waiver(subject_type: str, subject_id: str) -> bool:
     log.info(f"[{rid}] WAIVER_CHECK signed={signed} matching_signatures={len(rows)}")
     return signed
 
-
 # ───────── helpers for access + check-ins ────────────
 def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | None) -> bool:
     now = datetime.now(timezone.utc)
@@ -474,7 +541,6 @@ def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | 
             continue
     return False
 
-
 def record_checkin(
     *, subject_type: str, subject_id: str, method: str = "qr", location: str | None = None, source: str | None = None, meta: dict | None = None
 ) -> dict:
@@ -490,17 +556,14 @@ def record_checkin(
     rec["has_access_now"] = has_access_now_for_subject(rec.get("subject_user_id"), rec.get("dependent_id"))
     return rec
 
-
 # ───────────────────────── root + health ───────────────────────────
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "showtime-backend", "time": datetime.now(timezone.utc).isoformat()})
 
-
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-
 
 # ───────────────────────── signup/login ────────────────────────────
 @app.post("/signup")
@@ -540,7 +603,6 @@ def signup():
 
     return {"user_id": uid}, 201
 
-
 @app.post("/login")
 def login():
     body = request.get_json(force=True, silent=True) or {}
@@ -563,13 +625,11 @@ def login():
     except Exception as e:
         return err(f"invalid login: {e}", 401)
 
-
 # Legacy guard: block any old endpoint that could bypass waiver
 @app.post("/api/create-checkout-session")
 @auth_required
 def legacy_checkout_block():
     return err("This endpoint is deprecated. Use /api/checkout/session.", 410)
-
 
 # ───────────────────────── profiles / plans ────────────────────────
 @app.get("/api/profile/me")
@@ -580,7 +640,6 @@ def profile_me():
         return err("profile not found", 404)
     log.info(f"[{g._rid}] profile_me user_id={g.user_id}")
     return jsonify(rows[0])
-
 
 @app.get("/api/plans")
 def list_plans():
@@ -598,7 +657,6 @@ def list_plans():
         return jsonify(rows)
     except Exception as e:
         return err(f"failed to load plans: {e}", 500)
-
 
 # ───────────────────────── waiver endpoints ────────────────────────
 @app.get("/api/waivers/active")
@@ -646,7 +704,6 @@ def waiver_active():
 
     log.info(f"[{rid}] /api/waivers/active found id={w['id']} version={w['version']} signed={signed} sig_count={len(sigs)}")
     return jsonify({"waiver": w, "signed": signed})
-
 
 @app.post("/api/waivers/sign")
 @auth_required
@@ -762,7 +819,6 @@ def waiver_sign():
 
     return jsonify(sig), 201
 
-
 # ───────────────────────── checkout: session info ──────────────────
 @app.get("/api/checkout/session-info")
 @auth_required
@@ -830,7 +886,6 @@ def checkout_session_info():
         "subject": {"type": subj_type, "id": subj_id, "label": subject_label},
     }
     return jsonify(out)
-
 
 # ───────────────────────── checkout/session ────────────────────────
 @app.post("/api/checkout/session")
@@ -928,7 +983,6 @@ def create_checkout_session():
         return err(f"stripe checkout error: {e}", 400)
 
     return jsonify({"checkout_url": sess.url})
-
 
 # ───────────────────────── stripe webhook ──────────────────────────
 @app.post("/webhooks/stripe")
@@ -1219,6 +1273,64 @@ def stripe_webhook():
 
     return jsonify({"ok": True})
 
+# ───────── NEW: public scan endpoint (verifies token + records check-in) ─────────
+@app.post("/api/checkins/scan")
+def public_qr_scan():
+    """
+    Body JSON:
+      { "token": "<qr token>", "location": "front_desk", "source": "kiosk:hostname" }
+    Verifies signed token, inserts a check-in, returns access state + user display.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    token = (body.get("token") or "").strip()
+    location = body.get("location")
+    source = body.get("source")
+
+    if not token:
+        return err("token required", 400)
+
+    rid = getattr(g, "_rid", uuid4().hex[:8])
+
+    try:
+        user_id, exp_ts = _verify_qr_token(token)
+        log.info(f"[{rid}] scan token verified user={user_id} exp={exp_ts}")
+    except ValueError as e:
+        return err(str(e), 400)
+    except Exception as e:
+        log.error(f"[{rid}] scan verify error: {e}")
+        return err("verification failed", 400)
+
+    # Record check-in for the user as subject
+    rec = record_checkin(
+        subject_type="user",
+        subject_id=user_id,
+        method="qr",
+        location=location,
+        source=source,
+        meta={"exp": exp_ts},
+    )
+
+    # Fetch user display info
+    user = {}
+    try:
+        prof = (
+            sb_admin.table("user_profiles")
+            .select("first_name,last_name,email")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if prof:
+            user = {
+                "first_name": prof[0].get("first_name"),
+                "last_name": prof[0].get("last_name"),
+                "email": prof[0].get("email"),
+            }
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "checkin": rec, "user": user})
 
 # ───────────────────────── access check ────────────────────────────
 @app.get("/api/access/status")
@@ -1245,82 +1357,175 @@ def access_status():
     log.info(f"[{g._rid}] access_status subject_type={subject_type} can_enter={can_enter}")
     return jsonify({"subject_type": subject_type, "subject_id": subject_id, "can_enter": can_enter})
 
-
 # ───────────────────────── admin manual/cash periods ───────────────
 @app.post("/api/admin/periods")
 @auth_required
 @admin_required
 def admin_add_period():
     body = request.get_json(force=True, silent=True) or {}
+    rid = getattr(g, "_rid", "-")
+    log.info(f"[{rid}] /api/admin/periods start body={json.dumps(body, default=str)[:1000]}")
 
     user_membership_id = body.get("user_membership_id")
-    owner_user_id = body.get("owner_user_id") or g.user_id
+    owner_user_id = (body.get("owner_user_id") or g.user_id)
     subject_type = (body.get("subject_type") or "user").lower()
     subject_id = body.get("subject_id")
-    plan_id = body.get("plan_id")
-    period_start = body.get("period_start")
-    period_end = body.get("period_end")
-    amount_cents = body.get("amount_cents") or 0
+    plan_id = (body.get("plan_id") or "").strip()
+    period_start_iso = body.get("period_start")
+    period_end_iso = body.get("period_end")
+    amount_cents = body.get("amount_cents")
     notes = body.get("notes")
 
-    if not (period_start and period_end and plan_id):
+    # ---- Validation
+    if not plan_id or not period_start_iso or not period_end_iso:
         return err("period_start, period_end, plan_id required", 400)
     if subject_type not in ("user", "dependent"):
         return err("subject_type must be 'user' or 'dependent'", 400)
     if subject_type == "dependent" and not subject_id:
         return err("subject_id required for dependent", 400)
 
-    mem = None
-    if user_membership_id:
-        rows = sb_admin.table("user_memberships").select("*").eq("id", user_membership_id).limit(1).execute().data
-        if rows:
-            mem = rows[0]
-    if not mem:
-        mem = ensure_membership(
-            owner_user_id=owner_user_id,
-            plan_id=plan_id,
-            subject_user_id=(owner_user_id if subject_type == "user" else None),
-            dependent_id=(subject_id if subject_type == "dependent" else None),
-            status="active",
+    # Parse ISO times
+    try:
+        ps = _parse_ts(period_start_iso)
+        pe = _parse_ts(period_end_iso)
+        log.info(f"[{rid}] parsed times ps={ps.isoformat()} pe={pe.isoformat()}")
+    except Exception as e:
+        log.warning(f"[{rid}] time parse failed: {e}")
+        return err("Invalid datetime format; pass ISO 8601 strings", 400)
+    if ps >= pe:
+        return err("period_start must be before period_end", 400)
+
+    # Plan exists?
+    try:
+        plan_rows = (
+            sb_admin.table("membership_plans")
+            .select("id")
+            .eq("id", plan_id)
+            .limit(1)
+            .execute()
+            .data
         )
+        if not plan_rows:
+            return err("plan not found", 400)
+        log.info(f"[{rid}] plan ok id={plan_id}")
+    except Exception as e:
+        return err(f"plan lookup failed: {e}", 400)
 
-    mp = {
-        "user_membership_id": mem["id"],
-        "owner_user_id": mem["owner_user_id"],
-        "subject_user_id": mem.get("subject_user_id"),
-        "dependent_id": mem.get("dependent_id"),
-        "plan_id": mem["plan_id"],
-        "source": "manual",
-        "source_ref": None,
-        "period_start": period_start,
-        "period_end": period_end,
-    }
-    sb_admin.table("membership_periods").insert(mp).execute()
-    log.info(f"[{g._rid}] admin added period mem={mem['id']} {period_start}..{period_end}")
+    # amount
+    try:
+        if amount_cents is not None:
+            amount_cents = int(amount_cents)
+            if amount_cents < 0:
+                return err("amount_cents must be >= 0", 400)
+    except Exception:
+        return err("amount_cents must be an integer number of cents", 400)
 
-    if amount_cents:
-        receipt = {
+    # ---- Ensure membership
+    try:
+        mem = None
+        if user_membership_id:
+            rows = (
+                sb_admin.table("user_memberships")
+                .select("*")
+                .eq("id", user_membership_id)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if rows:
+                mem = rows[0]
+                log.info(f"[{rid}] using existing membership id={mem['id']}")
+        if not mem:
+            mem = ensure_membership(
+                owner_user_id=owner_user_id,
+                plan_id=plan_id,
+                subject_user_id=(owner_user_id if subject_type == "user" else None),
+                dependent_id=(subject_id if subject_type == "dependent" else None),
+                status="active",
+            )
+            log.info(f"[{rid}] ensured membership id={mem['id']} owner={mem['owner_user_id']}")
+    except Exception as e:
+        return err(f"ensure_membership failed: {e}", 400)
+
+    # ---- Idempotency: same window already present?
+    try:
+        existing = (
+            sb_admin.table("membership_periods")
+            .select("id")
+            .eq("user_membership_id", mem["id"])
+            .eq("period_start", ps.isoformat())
+            .eq("period_end", pe.isoformat())
+            .eq("is_voided", False)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if existing:
+            pid = existing[0]["id"]
+            log.info(f"[{rid}] idempotent: period already exists id={pid}")
+            resp = jsonify({"ok": True, "idempotent": True, "membership_period_id": pid})
+            resp.headers["x-request-id"] = rid
+            return resp
+    except Exception as e:
+        log.warning(f"[{rid}] idempotency check failed (continuing): {e}")
+
+    # ---- Insert coverage window
+    try:
+        mp = {
             "user_membership_id": mem["id"],
             "owner_user_id": mem["owner_user_id"],
             "subject_user_id": mem.get("subject_user_id"),
             "dependent_id": mem.get("dependent_id"),
             "plan_id": mem["plan_id"],
             "source": "manual",
-            "external_type": None,
-            "external_id": None,
-            "status": "succeeded",
-            "amount_cents": int(amount_cents),
-            "currency": "USD",
-            "notes": notes,
-            "paid_at": datetime.now(timezone.utc),
-            "created_by_user_id": g.user_id,
+            "source_ref": None,
+            "period_start": ps.isoformat(),
+            "period_end": pe.isoformat(),
         }
-        sb_admin.table("payment_receipts").insert(receipt).execute()
-        log.info(f"[{g._rid}] admin recorded cash receipt mem={mem['id']} amt={amount_cents}")
+        ins = sb_admin.table("membership_periods").insert(mp).execute().data[0]
+        log.info(f"[{rid}] inserted period id={ins['id']} {ps.isoformat()}..{pe.isoformat()}")
+    except Exception as e:
+        return err(f"period insert failed: {e}", 400)
 
-    sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
-    return jsonify({"ok": True})
+    # ---- Optional receipt: non-fatal
+    warnings: list[str] = []
+    try:
+        if amount_cents and amount_cents > 0:
+            receipt = {
+                "user_membership_id": mem["id"],
+                "owner_user_id": mem["owner_user_id"],
+                "subject_user_id": mem.get("subject_user_id"),
+                "dependent_id": mem.get("dependent_id"),
+                "plan_id": mem["plan_id"],
+                "source": "manual",
+                "external_type": None,
+                "external_id": None,
+                "status": "succeeded",
+                "amount_cents": amount_cents,
+                "currency": "USD",
+                "notes": (notes or "")[:500],
+                "paid_at": datetime.now(timezone.utc),
+                "created_by_user_id": g.user_id,
+            }
+            rec = sb_admin.table("payment_receipts").insert(receipt).execute().data[0]
+            log.info(f"[{rid}] recorded cash receipt id={rec['id']} amount_cents={amount_cents}")
+    except Exception as e:
+        msg = f"receipt insert failed: {e}"
+        log.warning(f"[{rid}] {msg}")
+        warnings.append(msg)
 
+    # ---- Keep membership marked active (best effort)
+    try:
+        sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
+    except Exception as e:
+        log.warning(f"[{rid}] set membership active failed: {e}")
+
+    out = {"ok": True, "membership_period_id": ins["id"]}
+    if warnings:
+        out["warnings"] = warnings
+    resp = jsonify(out)
+    resp.headers["x-request-id"] = rid
+    return resp
 
 # ───────────────────────── admin: manual check-in ──────────────────
 @app.post("/api/admin/checkins")
@@ -1343,7 +1548,6 @@ def admin_checkin():
     )
     return jsonify({"ok": True, "checkin": rec})
 
-
 # ───────────────────── admin: link Stripe customer ─────────────────
 def _map_subscription_status(status: str) -> str:
     status = (status or "").lower()
@@ -1354,7 +1558,6 @@ def _map_subscription_status(status: str) -> str:
     if status in ("canceled", "incomplete_expired"):
         return "canceled"
     return "inactive"
-
 
 def _find_plan_by_price_id(price_id: str) -> dict | None:
     try:
@@ -1369,7 +1572,6 @@ def _find_plan_by_price_id(price_id: str) -> dict | None:
         return rows[0] if rows else None
     except Exception:
         return None
-
 
 @app.post("/api/admin/stripe/link-customer")
 @auth_required
@@ -1530,7 +1732,6 @@ def admin_link_stripe_customer():
     except Exception as e:
         log.error(f"[{getattr(g, '_rid', '-')}] link-customer failed: {e}")
         return err(f"link failed: {e}", 500)
-
 
 # ───────────────────────── admin: users overview ───────────────────
 @app.get("/api/admin/users/overview")
@@ -1703,7 +1904,6 @@ def admin_users_overview():
         log.error(f"[{rid}] admin/overview failed: {e}")
         return err(f"admin overview failed: {e}", 500)
 
-
 # ───────────────────────── user: my check‑ins ──────────────────────
 @app.get("/api/checkins/mine")
 @auth_required
@@ -1729,7 +1929,6 @@ def my_checkins():
         return jsonify({"items": rows, "count": len(rows)})
     except Exception as e:
         return err(f"failed to load check-ins: {e}", 500)
-
 
 # memberships owned by me (for me or my dependents)
 @app.get("/api/memberships/mine/summary")
@@ -1790,7 +1989,6 @@ def my_membership_summary():
 
     return jsonify({"items": items, "counts_by_plan": counts_by_plan, "count": len(items)})
 
-
 @app.get("/api/family/dependents")
 @auth_required
 def list_my_dependents():
@@ -1823,7 +2021,6 @@ def list_my_dependents():
             d["is_primary"] = l.get("is_primary")
     items = list(by_id.values())
     return jsonify({"items": items, "count": len(items)})
-
 
 # ───────────────────────── admin: recent check-ins feed ────────────
 @app.get("/api/admin/checkins/recent")
@@ -1928,7 +2125,6 @@ def admin_recent_checkins():
         return jsonify({"items": items, "count": len(items)})
     except Exception as e:
         return err(f"failed to load recent check-ins: {e}", 500)
-
 
 # ───────────────────────── run server ──────────────────────────────
 if __name__ == "__main__":
