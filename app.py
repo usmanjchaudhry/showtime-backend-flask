@@ -22,7 +22,7 @@ from werkzeug.exceptions import HTTPException
 import stripe
 
 from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
+from supabase.lib.client_options import SyncClientOptions as ClientOptions
 
 import io
 import textwrap
