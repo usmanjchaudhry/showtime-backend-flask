@@ -10,6 +10,8 @@ from uuid import uuid4
 from time import perf_counter
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List
+import time
+import threading
 
 from flask import Flask, jsonify, request, make_response, g
 from dotenv import load_dotenv
@@ -32,6 +34,18 @@ from reportlab.lib.utils import ImageReader
 
 # ────────────────────────── env / clients ──────────────────────────
 load_dotenv()
+# ───────── In-memory throttle for Stripe sync (NO DB CHANGES) ─────────
+_STRIPE_SYNC_LAST: dict[str, float] = {}
+_STRIPE_SYNC_LOCKS: dict[str, threading.Lock] = {}
+_STRIPE_SYNC_LOCKS_GUARD = threading.Lock()
+
+def _get_user_lock(user_id: str) -> threading.Lock:
+    with _STRIPE_SYNC_LOCKS_GUARD:
+        lock = _STRIPE_SYNC_LOCKS.get(user_id)
+        if not lock:
+            lock = threading.Lock()
+            _STRIPE_SYNC_LOCKS[user_id] = lock
+        return lock
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]
@@ -408,6 +422,121 @@ def get_or_create_stripe_customer(user_id: str) -> str:
     sb_admin.table("user_profiles").update({"stripe_customer_id": cid}).eq("user_id", user_id).execute()
     log.info(f"[{g._rid}] created stripe customer {cid} for user {user_id}")
     return cid
+def _stripe_dashboard_base() -> str:
+    # If you're using a test secret key, use the /test dashboard path
+    key = (STRIPE_SECRET_KEY or "").strip()
+    if key.startswith("sk_test_"):
+        return "https://dashboard.stripe.com/test"
+    return "https://dashboard.stripe.com"
+
+def stripe_customer_dashboard_url(customer_id: str | None) -> str | None:
+    if not customer_id:
+        return None
+    return f"https://dashboard.stripe.com/customers/{customer_id}"
+def ensure_one_time_period_from_meta(
+    meta: dict,
+    *,
+    external_id: str,
+    created_ts: int | None,
+    amount_total: int | None,
+    currency: str | None,
+) -> tuple[dict, bool]:
+    plan_id = (meta.get("plan_id") or "").strip()
+    owner_user_id = (meta.get("owner_user_id") or "").strip()
+    subject_user_id = (meta.get("subject_user_id") or "").strip() or None
+    dependent_id = (meta.get("dependent_id") or "").strip() or None
+
+    if not (plan_id and owner_user_id):
+        raise ValueError("session metadata missing plan_id or owner_user_id")
+
+    # Load plan
+    plan_rows = (
+        sb_admin.table("membership_plans")
+        .select("id,interval,interval_count")
+        .eq("id", plan_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not plan_rows:
+        raise ValueError("plan not found")
+    plan = plan_rows[0]
+
+    # If no dependent id, default subject to the owner
+    subject_uid = subject_user_id or (owner_user_id if not dependent_id else None)
+
+    mem = ensure_membership(
+        owner_user_id=owner_user_id,
+        plan_id=plan_id,
+        subject_user_id=subject_uid,
+        dependent_id=dependent_id,
+        status="active",
+    )
+
+    # Idempotency: period already created for this checkout session?
+    exists = (
+        sb_admin.table("membership_periods")
+        .select("id")
+        .eq("source", "stripe")
+        .eq("source_ref", external_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+
+    created_period = False
+    if not exists:
+        start = to_utc_ts(created_ts) if created_ts else datetime.now(timezone.utc)
+        end = add_interval(start, plan.get("interval") or "day", plan.get("interval_count") or 1)
+
+        sb_admin.table("membership_periods").insert(
+            {
+                "user_membership_id": mem["id"],
+                "owner_user_id": mem["owner_user_id"],
+                "subject_user_id": mem.get("subject_user_id"),
+                "dependent_id": mem.get("dependent_id"),
+                "plan_id": mem["plan_id"],
+                "source": "stripe",
+                "source_ref": external_id,
+                "period_start": start,
+                "period_end": end,
+            }
+        ).execute()
+        created_period = True
+
+    # Optional receipt (idempotent)
+    if amount_total is not None:
+        rec_existing = (
+            sb_admin.table("payment_receipts")
+            .select("id")
+            .eq("source", "stripe")
+            .eq("external_id", external_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not rec_existing:
+            sb_admin.table("payment_receipts").insert(
+                {
+                    "user_membership_id": mem["id"],
+                    "owner_user_id": mem["owner_user_id"],
+                    "subject_user_id": mem.get("subject_user_id"),
+                    "dependent_id": mem.get("dependent_id"),
+                    "plan_id": mem["plan_id"],
+                    "source": "stripe",
+                    "external_type": "checkout_session",
+                    "external_id": external_id,
+                    "status": "succeeded",
+                    "amount_cents": int(amount_total or 0),
+                    "currency": (currency or "USD").upper(),
+                    "paid_at": datetime.now(timezone.utc),
+                }
+            ).execute()
+
+    # Keep membership active
+    sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
+
+    return mem, created_period
 
 def ensure_membership(
     owner_user_id: str,
@@ -630,6 +759,32 @@ def login():
 @auth_required
 def legacy_checkout_block():
     return err("This endpoint is deprecated. Use /api/checkout/session.", 410)
+@app.post("/api/auth/refresh")
+def auth_refresh():
+    """
+    Body: { "refresh_token": "..." }
+    Returns same shape as /login:
+      { access_token, refresh_token, user_id, expires_in, token_type }
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    refresh_token = (body.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return err("refresh_token required", 400)
+
+    try:
+        # supabase-py typically returns an object similar to sign_in_with_password
+        res = sb_public.auth.refresh_session(refresh_token)
+        session = res.session
+        user = res.user
+        return jsonify({
+            "access_token": session.access_token,
+            "refresh_token": session.refresh_token,
+            "user_id": user.id,
+            "expires_in": session.expires_in,
+            "token_type": session.token_type,
+        })
+    except Exception as e:
+        return err(f"refresh failed: {e}", 401)
 
 # ───────────────────────── profiles / plans ────────────────────────
 @app.get("/api/profile/me")
@@ -886,6 +1041,150 @@ def checkout_session_info():
         "subject": {"type": subj_type, "id": subj_id, "label": subject_label},
     }
     return jsonify(out)
+@app.post("/api/checkout/finalize")
+@auth_required
+def checkout_finalize():
+    if not STRIPE_SECRET_KEY:
+        return err("stripe not configured", 500)
+
+    body = request.get_json(force=True, silent=True) or {}
+    sid = (body.get("session_id") or body.get("sessionId") or "").strip()
+    if not sid:
+        return err("session_id required", 400)
+
+    try:
+        sess = stripe.checkout.Session.retrieve(sid)
+    except Exception as e:
+        return err(f"invalid session_id: {e}", 400)
+
+    md = sess.get("metadata", {}) or {}
+    owner_user_id = (md.get("owner_user_id") or "").strip()
+
+    # Security: only the owner can finalize their checkout
+    if not owner_user_id or owner_user_id != g.user_id:
+        return err("forbidden", 403)
+
+    # Only finalize completed sessions
+    if sess.get("status") != "complete" and sess.get("payment_status") != "paid":
+        return err("checkout session not complete yet", 409)
+
+    mode = (sess.get("mode") or "").lower()
+    customer_id = sess.get("customer")
+    plan_id = (md.get("plan_id") or "").strip()
+    if not plan_id:
+        return err("missing plan_id in session metadata", 400)
+
+    subject_user_id = (md.get("subject_user_id") or "").strip() or None
+    dependent_id = (md.get("dependent_id") or "").strip() or None
+    if not subject_user_id and not dependent_id:
+        subject_user_id = owner_user_id
+
+    # --- Subscription checkout
+    if mode == "subscription":
+        sub_id = sess.get("subscription")
+        if not sub_id:
+            return err("subscription missing on session", 400)
+
+        try:
+            sub = stripe.Subscription.retrieve(sub_id)
+        except Exception as e:
+            return err(f"could not retrieve subscription: {e}", 400)
+
+        sub_status = (sub.get("status") or "").lower()
+        # Keep mapping consistent with your other logic
+        mapped_status = (
+            "active" if sub_status in ("active", "trialing")
+            else "past_due" if sub_status in ("past_due", "incomplete", "unpaid", "paused")
+            else "canceled" if sub_status in ("canceled", "incomplete_expired")
+            else "past_due"
+        )
+
+        mem = ensure_membership(
+            owner_user_id=owner_user_id,
+            plan_id=plan_id,
+            subject_user_id=subject_user_id,
+            dependent_id=dependent_id,
+            provider_customer_id=customer_id,
+            provider_subscription_id=sub_id,
+            status=mapped_status,
+        )
+
+        created_period = False
+        start_ts = sub.get("current_period_start")
+        end_ts = sub.get("current_period_end")
+        if start_ts and end_ts:
+            src_ref = f"{sub_id}:{int(start_ts)}"
+            exists = (
+                sb_admin.table("membership_periods")
+                .select("id")
+                .eq("source", "stripe")
+                .eq("source_ref", src_ref)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not exists:
+                sb_admin.table("membership_periods").insert(
+                    {
+                        "user_membership_id": mem["id"],
+                        "owner_user_id": mem["owner_user_id"],
+                        "subject_user_id": mem.get("subject_user_id"),
+                        "dependent_id": mem.get("dependent_id"),
+                        "plan_id": mem["plan_id"],
+                        "source": "stripe",
+                        "source_ref": src_ref,
+                        "period_start": to_utc_ts(int(start_ts)),
+                        "period_end": to_utc_ts(int(end_ts)),
+                    }
+                ).execute()
+                created_period = True
+
+        sb_admin.table("user_memberships").update({"status": mapped_status}).eq("id", mem["id"]).execute()
+
+        return jsonify(
+            {
+                "ok": True,
+                "mode": "subscription",
+                "membership_id": mem["id"],
+                "status": mapped_status,
+                "customer_id": customer_id,
+                "subscription_id": sub_id,
+                "period_backfilled": created_period,
+            }
+        )
+
+    # --- One-time payment checkout
+    if mode == "payment":
+        amount_total = sess.get("amount_total")
+        currency = sess.get("currency")
+        created_ts = sess.get("created")
+        external_id = sess.get("id")
+
+        try:
+            mem, created_period = ensure_one_time_period_from_meta(
+                md,
+                external_id=external_id,
+                created_ts=created_ts,
+                amount_total=amount_total,
+                currency=currency,
+            )
+        except Exception as e:
+            return err(f"finalize failed: {e}", 400)
+
+        return jsonify(
+            {
+                "ok": True,
+                "mode": "payment",
+                "membership_id": mem["id"],
+                "status": "active",
+                "customer_id": customer_id,
+                "subscription_id": None,
+                "period_backfilled": created_period,
+            }
+        )
+
+    return err("unsupported checkout mode", 400)
+
 
 # ───────────────────────── checkout/session ────────────────────────
 @app.post("/api/checkout/session")
@@ -949,8 +1248,8 @@ def create_checkout_session():
     }
 
     base = FRONTEND_URL or "http://localhost:5173"
-    success_url = f"{base}/memberships?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{base}/memberships"
+    success_url = f"{base}/purchase?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{base}/purchase"
 
     log.info(
         f"[{rid}] /api/checkout/session creating stripe session mode={checkout_mode} "
@@ -1276,11 +1575,6 @@ def stripe_webhook():
 # ───────── NEW: public scan endpoint (verifies token + records check-in) ─────────
 @app.post("/api/checkins/scan")
 def public_qr_scan():
-    """
-    Body JSON:
-      { "token": "<qr token>", "location": "front_desk", "source": "kiosk:hostname" }
-    Verifies signed token, inserts a check-in, returns access state + user display.
-    """
     body = request.get_json(force=True, silent=True) or {}
     token = (body.get("token") or "").strip()
     location = body.get("location")
@@ -1300,17 +1594,41 @@ def public_qr_scan():
         log.error(f"[{rid}] scan verify error: {e}")
         return err("verification failed", 400)
 
-    # Record check-in for the user as subject
+    # 1) Fast DB check
+    had_access_before = has_access_now_for_subject(user_id, None)
+
+    sync_info = None
+    # 2) Only if denied, do a throttled Stripe sync
+    if not had_access_before:
+        try:
+            sync_info = sync_stripe_for_user(user_id, min_age_seconds=300, force=False)
+        except Exception as e:
+            log.warning(f"[{rid}] checkin fallback sync failed: {str(e)[:200]}")
+            sync_info = {"ok": False, "error": "sync failed"}
+
+    # 3) Re-check after sync attempt
+    has_access_after = has_access_now_for_subject(user_id, None)
+
+    # 4) Record the check-in AFTER the sync/recheck so rec.has_access_now is accurate
     rec = record_checkin(
         subject_type="user",
         subject_id=user_id,
         method="qr",
         location=location,
         source=source,
-        meta={"exp": exp_ts},
+        meta={
+            "exp": exp_ts,
+            "access_before": had_access_before,
+            "access_after": has_access_after,
+            "sync": {
+                "ok": sync_info.get("ok") if isinstance(sync_info, dict) else None,
+                "skipped": sync_info.get("skipped") if isinstance(sync_info, dict) else None,
+                "reason": sync_info.get("reason") if isinstance(sync_info, dict) else None,
+            } if sync_info else None,
+        },
     )
 
-    # Fetch user display info
+    # Fetch user display info (optional)
     user = {}
     try:
         prof = (
@@ -1330,7 +1648,8 @@ def public_qr_scan():
     except Exception:
         pass
 
-    return jsonify({"ok": True, "checkin": rec, "user": user})
+    return jsonify({"ok": True, "checkin": rec, "user": user, "sync": sync_info})
+
 
 # ───────────────────────── access check ────────────────────────────
 @app.get("/api/access/status")
@@ -1553,11 +1872,206 @@ def _map_subscription_status(status: str) -> str:
     status = (status or "").lower()
     if status in ("active", "trialing"):
         return "active"
-    if status in ("past_due", "incomplete", "unpaid"):
+    if status in ("past_due", "incomplete", "unpaid", "paused"):
         return "past_due"
     if status in ("canceled", "incomplete_expired"):
         return "canceled"
-    return "inactive"
+    return "past_due"  # safer than "inactive" unless you KNOW it's in your enum
+
+def _stripe_list_data(obj) -> list:
+    if obj is None:
+        return []
+    if hasattr(obj, "data"):
+        return getattr(obj, "data") or []
+    try:
+        return obj.get("data") or []
+    except Exception:
+        return []
+
+def sync_stripe_for_user(user_id: str, *, min_age_seconds: int = 300, force: bool = False) -> dict:
+    """
+    Sync Stripe subscriptions -> local DB.
+    NO DB schema changes.
+    Throttle is in-memory only (per backend instance).
+    """
+    rid = getattr(g, "_rid", uuid4().hex[:8])
+
+    if not STRIPE_SECRET_KEY:
+        return {"ok": False, "error": "stripe not configured"}
+
+    # Load Stripe customer id from existing profile column
+    prof_rows = (
+        sb_admin.table("user_profiles")
+        .select("user_id,stripe_customer_id")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not prof_rows:
+        return {"ok": False, "error": "profile missing"}
+
+    customer_id = prof_rows[0].get("stripe_customer_id")
+    if not customer_id:
+        return {"ok": True, "skipped": True, "reason": "no stripe_customer_id"}
+
+    # Throttle (memory only)
+    now = time.time()
+    if not force and min_age_seconds:
+        last = _STRIPE_SYNC_LAST.get(user_id, 0.0)
+        if (now - last) < float(min_age_seconds):
+            return {"ok": True, "skipped": True, "reason": "throttled"}
+
+    lock = _get_user_lock(user_id)
+    with lock:
+        # re-check throttle inside lock
+        now = time.time()
+        if not force and min_age_seconds:
+            last = _STRIPE_SYNC_LAST.get(user_id, 0.0)
+            if (now - last) < float(min_age_seconds):
+                return {"ok": True, "skipped": True, "reason": "throttled"}
+
+        updated_memberships = 0
+        created_periods = 0
+        notes: list[str] = []
+
+        # List subscriptions (all statuses)
+        subs = stripe.Subscription.list(
+            customer=customer_id,
+            status="all",
+            limit=100,
+            expand=["data.items.data.price"],
+        )
+
+        for s in _stripe_list_data(subs):
+            # dict vs object
+            if isinstance(s, dict):
+                sub_id = s.get("id")
+                sub_status = s.get("status") or ""
+                start_ts = s.get("current_period_start")
+                end_ts = s.get("current_period_end")
+                items = (s.get("items") or {}).get("data") or []
+            else:
+                sub_id = getattr(s, "id", None)
+                sub_status = getattr(s, "status", "") or ""
+                start_ts = getattr(s, "current_period_start", None)
+                end_ts = getattr(s, "current_period_end", None)
+                items = getattr(getattr(s, "items", None), "data", []) or []
+
+            mapped_status = _map_subscription_status(sub_status)
+
+            for it in items:
+                price = it.get("price") if isinstance(it, dict) else getattr(it, "price", None)
+                price_id = price.get("id") if isinstance(price, dict) else getattr(price, "id", None)
+                if not price_id:
+                    continue
+
+                plan = _find_plan_by_price_id(price_id)
+                if not plan:
+                    notes.append(f"no plan for price_id={price_id}")
+                    continue
+
+                mem = ensure_membership(
+                    owner_user_id=user_id,
+                    plan_id=plan["id"],
+                    subject_user_id=user_id,
+                    dependent_id=None,
+                    provider_customer_id=customer_id,
+                    provider_subscription_id=sub_id,
+                    status=mapped_status,
+                )
+                updated_memberships += 1
+
+                # Ensure current period exists (idempotent check in code)
+                if start_ts and end_ts:
+                    src_ref = f"{sub_id}:{int(start_ts)}"
+                    exists = (
+                        sb_admin.table("membership_periods")
+                        .select("id")
+                        .eq("source", "stripe")
+                        .eq("source_ref", src_ref)
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if not exists:
+                        try:
+                            sb_admin.table("membership_periods").insert(
+                                {
+                                    "user_membership_id": mem["id"],
+                                    "owner_user_id": mem["owner_user_id"],
+                                    "subject_user_id": mem.get("subject_user_id"),
+                                    "dependent_id": mem.get("dependent_id"),
+                                    "plan_id": mem["plan_id"],
+                                    "source": "stripe",
+                                    "source_ref": src_ref,
+                                    "period_start": to_utc_ts(int(start_ts)),
+                                    "period_end": to_utc_ts(int(end_ts)),
+                                }
+                            ).execute()
+                            created_periods += 1
+                        except Exception as e:
+                            # In case of rare race duplicates, don’t fail check-in
+                            notes.append(f"period insert failed (maybe duplicate): {str(e)[:120]}")
+
+        _STRIPE_SYNC_LAST[user_id] = time.time()
+
+        return {
+            "ok": True,
+            "customer_id": customer_id,
+            "customer_url": stripe_customer_dashboard_url(customer_id),
+            "updated_memberships": updated_memberships,
+            "created_periods": created_periods,
+            "notes": notes[:10],
+        }
+CRON_SECRET = os.getenv("CRON_SECRET")
+
+@app.post("/internal/cron/stripe-reconcile")
+def cron_stripe_reconcile():
+    if not CRON_SECRET:
+        return err("CRON_SECRET not configured", 500)
+
+    if request.headers.get("x-cron-secret") != CRON_SECRET:
+        return err("forbidden", 403)
+
+    max_users = min(max(int(request.args.get("max_users", "5000")), 1), 50000)
+
+    processed = 0
+    synced = 0
+    skipped = 0
+    failed = 0
+
+    # For most gyms, fetching all is fine. If you have tons of users, paginate.
+    rows = (
+        sb_admin.table("user_profiles")
+        .select("user_id,stripe_customer_id")
+        .execute()
+        .data
+    ) or []
+
+    for r in rows:
+        if processed >= max_users:
+            break
+        processed += 1
+
+        uid = r.get("user_id")
+        cid = r.get("stripe_customer_id")
+        if not uid or not cid:
+            skipped += 1
+            continue
+
+        try:
+            # force=True disables throttle so cron always reconciles
+            res = sync_stripe_for_user(uid, min_age_seconds=0, force=True)
+            if res.get("skipped"):
+                skipped += 1
+            else:
+                synced += 1
+        except Exception as e:
+            failed += 1
+            log.warning(f"[cron] reconcile failed user_id={uid}: {str(e)[:200]}")
+
+    return jsonify({"ok": True, "processed": processed, "synced": synced, "skipped": skipped, "failed": failed})
 
 def _find_plan_by_price_id(price_id: str) -> dict | None:
     try:
@@ -1577,19 +2091,10 @@ def _find_plan_by_price_id(price_id: str) -> dict | None:
 @auth_required
 @admin_required
 def admin_link_stripe_customer():
-    """
-    Link a Supabase user to an existing Stripe Customer and backfill memberships.
-
-    Request JSON (one of `stripe_customer_id` or `email` is required):
-    {
-      "user_id": "<supabase user id>",            # required
-      "stripe_customer_id": "cus_...",            # optional
-      "email": "person@example.com"               # optional (used if customer id not given)
-    }
-    """
     if not STRIPE_SECRET_KEY:
         return err("stripe not configured", 500)
 
+    rid = getattr(g, "_rid", "-")
     body = request.get_json(force=True, silent=True) or {}
     user_id = (body.get("user_id") or "").strip()
     stripe_customer_id = (body.get("stripe_customer_id") or "").strip()
@@ -1598,6 +2103,10 @@ def admin_link_stripe_customer():
     if not user_id:
         return err("user_id required", 400)
 
+    linked: list[dict] = []
+    warnings: list[str] = []
+
+    # ---- Phase 1: resolve + persist the Stripe customer link (this is the core action)
     try:
         if not stripe_customer_id:
             if not email:
@@ -1618,31 +2127,42 @@ def admin_link_stripe_customer():
                 return err(f"No Stripe customer found for email {email}", 404)
             stripe_customer_id = custs["data"][0]["id"]
 
-        # persist on profile
-        sb_admin.table("user_profiles").update({"stripe_customer_id": stripe_customer_id}).eq("user_id", user_id).execute()
+        # persist on profile FIRST
+        sb_admin.table("user_profiles").update(
+            {"stripe_customer_id": stripe_customer_id}
+        ).eq("user_id", user_id).execute()
 
-        # fetch subscriptions
+    except Exception as e:
+        log.error(f"[{rid}] link-customer resolve/persist failed: {e}")
+        return err(f"link failed: {e}", 500)
+
+    # ---- Phase 2: backfill (best effort — never fail request after link succeeded)
+    try:
         subs = stripe.Subscription.list(
             customer=stripe_customer_id,
             status="all",
             limit=100,
             expand=["data.items.data.price"],
         )
+    except Exception as e:
+        warnings.append(f"Could not list subscriptions: {str(e)[:200]}")
+        return jsonify({"ok": True, "customer_id": stripe_customer_id, "linked": [], "warnings": warnings})
 
-        linked: list[dict] = []
+    for s in subs.get("data", []) or []:
+        sub_id = s.get("id")
+        sub_status = s.get("status") or ""
 
-        for s in subs.get("data", []):
-            sub_id = s.get("id")
-            sub_status = s.get("status") or ""
-            mapped_status = _map_subscription_status(sub_status)
+        # IMPORTANT: membership_status enum safety
+        mapped_status = _map_subscription_status(sub_status)
 
-            items = (s.get("items") or {}).get("data") or []
-            for it in items:
-                price = it.get("price") or {}
-                price_id = price.get("id")
-                if not price_id:
-                    continue
+        items = (s.get("items") or {}).get("data") or []
+        for it in items:
+            price = it.get("price") or {}
+            price_id = price.get("id")
+            if not price_id:
+                continue
 
+            try:
                 plan = _find_plan_by_price_id(price_id)
                 if not plan:
                     linked.append(
@@ -1658,7 +2178,6 @@ def admin_link_stripe_customer():
                     )
                     continue
 
-                # ensure membership row
                 mem = ensure_membership(
                     owner_user_id=user_id,
                     plan_id=plan["id"],
@@ -1669,7 +2188,7 @@ def admin_link_stripe_customer():
                     status=mapped_status,
                 )
 
-                # backfill current period (idempotent) — use source="stripe" to satisfy DB check constraint
+                # backfill current period (idempotent)
                 created_period = False
                 start_ts = s.get("current_period_start")
                 end_ts = s.get("current_period_end")
@@ -1682,13 +2201,14 @@ def admin_link_stripe_customer():
                         sb_admin.table("membership_periods")
                         .select("id")
                         .eq("user_membership_id", mem["id"])
-                        .eq("source", "stripe")
+                        .eq("source", "stripe")  # ✅ matches your CHECK constraint
                         .eq("source_ref", src_ref)
                         .limit(1)
                         .execute()
                         .data
                     )
                     if not existing:
+                        # prevent dup by window too
                         existing = (
                             sb_admin.table("membership_periods")
                             .select("id")
@@ -1704,11 +2224,11 @@ def admin_link_stripe_customer():
                         sb_admin.table("membership_periods").insert(
                             {
                                 "user_membership_id": mem["id"],
-                                "owner_user_id": mem["owner_user_id"],
+                                "owner_user_id": mem["owner_user_id"],  # NOT NULL ✅
                                 "subject_user_id": mem.get("subject_user_id"),
                                 "dependent_id": mem.get("dependent_id"),
-                                "plan_id": mem["plan_id"],
-                                "source": "stripe",
+                                "plan_id": mem["plan_id"],  # NOT NULL ✅
+                                "source": "stripe",  # ✅ allowed by CHECK constraint
                                 "source_ref": src_ref,
                                 "period_start": period_start_dt,
                                 "period_end": period_end_dt,
@@ -1727,11 +2247,24 @@ def admin_link_stripe_customer():
                     }
                 )
 
-        return jsonify({"ok": True, "customer_id": stripe_customer_id, "linked": linked})
+            except Exception as e:
+                # don’t break the whole request — record the failure
+                linked.append(
+                    {
+                        "subscription_id": sub_id,
+                        "status": sub_status,
+                        "price_id": price_id,
+                        "plan_id": None,
+                        "plan_slug": None,
+                        "period_backfilled": False,
+                        "note": f"Backfill error: {str(e)[:200]}",
+                    }
+                )
+                continue
 
-    except Exception as e:
-        log.error(f"[{getattr(g, '_rid', '-')}] link-customer failed: {e}")
-        return err(f"link failed: {e}", 500)
+    return jsonify({"ok": True, "customer_id": stripe_customer_id, "linked": linked, "warnings": warnings})
+
+
 
 # ───────────────────────── admin: users overview ───────────────────
 @app.get("/api/admin/users/overview")
@@ -1762,7 +2295,7 @@ def admin_users_overview():
         # 1) Users (owners)
         users: List[dict] = (
             sb_admin.table("user_profiles")
-            .select("user_id,email,first_name,last_name")
+            .select("user_id,email,first_name,last_name,stripe_customer_id")
             .order("first_name", desc=False)
             .execute()
             .data
@@ -1895,6 +2428,9 @@ def admin_users_overview():
                     "waiver_required": waiver_required,
                     "waiver_signed": (oid in signed_subjects) if waiver_required else None,
                     "memberships": mems_fmt,
+                    "stripe_customer_id": u.get("stripe_customer_id"),
+                    "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id")),
+
                 }
             )
 
