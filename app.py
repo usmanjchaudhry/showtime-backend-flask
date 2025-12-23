@@ -2563,20 +2563,11 @@ def list_my_dependents():
 @auth_required
 @admin_required
 def admin_recent_checkins():
-    """
-    Admin-only feed of recent check-ins.
-    Query params:
-      - limit (int, default 50, max 200)
-      - since_min (int, optional): only rows from the last N minutes
-    Returns:
-      {
-        "items": [{ ... }],
-        "count": <int>
-      }
-    """
+    rid = getattr(g, "_rid", "-")
     try:
         limit = min(max(int(request.args.get("limit", "50")), 1), 200)
         since_min = int(request.args.get("since_min", "0"))
+
         q = (
             sb_admin.table("gym_checkins")
             .select("id,subject_user_id,dependent_id,scanned_at,method,location,source,meta")
@@ -2589,10 +2580,10 @@ def admin_recent_checkins():
 
         rows = q.execute().data or []
 
-        # Prefetch names/emails
-        user_ids = [r["subject_user_id"] for r in rows if r.get("subject_user_id")]
-        dep_ids = [r["dependent_id"] for r in rows if r.get("dependent_id")]
+        user_ids = sorted({r.get("subject_user_id") for r in rows if r.get("subject_user_id")})
+        dep_ids  = sorted({r.get("dependent_id")    for r in rows if r.get("dependent_id")})
 
+        # Prefetch profiles
         users_by_id = {}
         if user_ids:
             ups = (
@@ -2604,6 +2595,7 @@ def admin_recent_checkins():
             ) or []
             users_by_id = {u["user_id"]: u for u in ups}
 
+        # Prefetch dependents
         deps_by_id = {}
         if dep_ids:
             dps = (
@@ -2615,52 +2607,88 @@ def admin_recent_checkins():
             ) or []
             deps_by_id = {d["id"]: d for d in dps}
 
+        # ✅ Batch access checks (1 query for users, 1 for dependents)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        active_users = set()
+        active_deps = set()
+
+        if user_ids:
+            pr = (
+                sb_admin.table("membership_periods")
+                .select("subject_user_id")
+                .eq("is_voided", False)
+                .in_("subject_user_id", user_ids)
+                .lte("period_start", now_iso)
+                .gt("period_end", now_iso)
+                .execute()
+                .data
+            ) or []
+            active_users = {r.get("subject_user_id") for r in pr if r.get("subject_user_id")}
+
+        if dep_ids:
+            pr = (
+                sb_admin.table("membership_periods")
+                .select("dependent_id")
+                .eq("is_voided", False)
+                .in_("dependent_id", dep_ids)
+                .lte("period_start", now_iso)
+                .gt("period_end", now_iso)
+                .execute()
+                .data
+            ) or []
+            active_deps = {r.get("dependent_id") for r in pr if r.get("dependent_id")}
+
+        # Shape response
         items = []
         for r in rows:
             su = r.get("subject_user_id")
             di = r.get("dependent_id")
+
             if su:
                 prof = users_by_id.get(su, {})
-                label = f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip() or prof.get("email") or "Member"
-                email = prof.get("email")
-                has_now = has_access_now_for_subject(su, None)
-                items.append(
-                    {
-                        "id": r["id"],
-                        "scanned_at": r["scanned_at"],
-                        "method": r.get("method"),
-                        "location": r.get("location"),
-                        "source": r.get("source"),
-                        "subject_type": "user",
-                        "subject_id": su,
-                        "subject_label": label,
-                        "email": email,
-                        "has_access_now": has_now,
-                    }
+                label = (
+                    f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip()
+                    or prof.get("email")
+                    or "Member"
                 )
+                items.append({
+                    "id": r["id"],
+                    "scanned_at": r.get("scanned_at"),
+                    "method": r.get("method"),
+                    "location": r.get("location"),
+                    "source": r.get("source"),
+                    "subject_type": "user",
+                    "subject_id": su,
+                    "subject_label": label,
+                    "email": prof.get("email"),
+                    "has_access_now": su in active_users,
+                })
             else:
                 dep = deps_by_id.get(di, {})
-                label = f"{(dep.get('first_name') or '').strip()} {(dep.get('last_name') or '').strip()}".strip() or "Dependent"
-                email = dep.get("email")
-                has_now = has_access_now_for_subject(None, di)
-                items.append(
-                    {
-                        "id": r["id"],
-                        "scanned_at": r["scanned_at"],
-                        "method": r.get("method"),
-                        "location": r.get("location"),
-                        "source": r.get("source"),
-                        "subject_type": "dependent",
-                        "subject_id": di,
-                        "subject_label": label,
-                        "email": email,
-                        "has_access_now": has_now,
-                    }
+                label = (
+                    f"{(dep.get('first_name') or '').strip()} {(dep.get('last_name') or '').strip()}".strip()
+                    or "Dependent"
                 )
+                items.append({
+                    "id": r["id"],
+                    "scanned_at": r.get("scanned_at"),
+                    "method": r.get("method"),
+                    "location": r.get("location"),
+                    "source": r.get("source"),
+                    "subject_type": "dependent",
+                    "subject_id": di,
+                    "subject_label": label,
+                    "email": dep.get("email"),
+                    "has_access_now": di in active_deps,
+                })
 
         return jsonify({"items": items, "count": len(items)})
+
     except Exception as e:
+        # ✅ This will show you EXACTLY where Errno 11 is thrown
+        log.error(f"[{rid}] admin_recent_checkins failed: {e}", exc_info=True)
         return err(f"failed to load recent check-ins: {e}", 500)
+
 
 # ───────────────────────── run server ──────────────────────────────
 if __name__ == "__main__":
