@@ -1,4 +1,5 @@
 # app.py — waiver‑gated checkout + subscriptions + one‑time + admin link/backfill
+import re
 import os
 import json
 import logging
@@ -31,6 +32,8 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
+import requests
+import html as html_lib
 
 # ────────────────────────── env / clients ──────────────────────────
 load_dotenv()
@@ -55,6 +58,253 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 WAIVER_BUCKET = os.getenv("WAIVER_BUCKET", "waivers")
+# ────────────────────────── mailchimp config ──────────────────────────
+MAILCHIMP_API_KEY = (os.getenv("MAILCHIMP_API_KEY") or "").strip()
+MAILCHIMP_AUDIENCE_ID = (os.getenv("MAILCHIMP_AUDIENCE_ID") or "").strip()
+MAILCHIMP_SERVER_PREFIX = (os.getenv("MAILCHIMP_SERVER_PREFIX") or "").strip()
+MAILCHIMP_FROM_NAME = (os.getenv("MAILCHIMP_FROM_NAME") or "Showtime Boxing").strip()
+MAILCHIMP_REPLY_TO = (os.getenv("MAILCHIMP_REPLY_TO") or "info@showtimeboxinggym.com").strip()
+
+# Many Mailchimp API keys are like "...-us21"
+if MAILCHIMP_API_KEY and not MAILCHIMP_SERVER_PREFIX and "-" in MAILCHIMP_API_KEY:
+    MAILCHIMP_SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1].strip()
+
+MAILCHIMP_BASE_URL = f"https://{MAILCHIMP_SERVER_PREFIX}.api.mailchimp.com/3.0" if MAILCHIMP_SERVER_PREFIX else ""
+
+def _mailchimp_enabled() -> bool:
+    return bool(MAILCHIMP_API_KEY and MAILCHIMP_AUDIENCE_ID and MAILCHIMP_SERVER_PREFIX)
+
+def _mc_require():
+    if not _mailchimp_enabled():
+        raise ValueError("Mailchimp not configured. Set MAILCHIMP_API_KEY, MAILCHIMP_AUDIENCE_ID, MAILCHIMP_SERVER_PREFIX.")
+
+def mc_request(method: str, path: str, *, params=None, json_body=None, timeout=25):
+    """
+    Mailchimp Marketing API request helper.
+    Uses HTTP Basic auth: username can be anything, password is API key.
+    """
+    _mc_require()
+    url = f"{MAILCHIMP_BASE_URL}{path}"
+
+    # g may not exist in some contexts
+    rid = "-"
+    try:
+        rid = getattr(g, "_rid", "-")
+    except Exception:
+        pass
+
+    log.info(f"[{rid}] mailchimp {method.upper()} {path}")
+
+    r = requests.request(
+        method=method.upper(),
+        url=url,
+        params=params,
+        json=json_body,
+        auth=("anystring", MAILCHIMP_API_KEY),
+        timeout=timeout,
+    )
+
+    text = r.text or ""
+    if r.status_code >= 400:
+        detail = text
+        try:
+            j = r.json()
+            detail = j.get("detail") or j.get("title") or detail
+            # ✅ Mailchimp often includes exact bad fields here:
+            # e.g. [{"field":"merge_fields.FNAME","message":"This field is required."}]
+            if j.get("errors"):
+                detail = f"{detail} | errors={j.get('errors')}"
+        except Exception:
+            pass
+        raise ValueError(f"mailchimp {r.status_code}: {detail}")
+
+    if not text.strip():
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": text}
+
+
+def mc_subscriber_hash(email: str) -> str:
+    return hashlib.md5(email.strip().lower().encode("utf-8")).hexdigest()
+def mc_format_phone(raw: str | None) -> str | None:
+    """
+    Mailchimp PHONE merge field expects: (###) ### - ####
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 10:
+        return f"({digits[0:3]}) {digits[3:6]} - {digits[6:10]}"
+    return None
+
+def mc_format_birthday(raw: str | None) -> str | None:
+    """
+    Mailchimp BIRTHDAY merge field expects: MM/DD
+    Accepts: MM/DD or ISO dates like YYYY-MM-DD (or ISO datetime).
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+
+    # already in MM/DD
+    if re.fullmatch(r"\d{2}/\d{2}", s):
+        return s
+
+    # try ISO date/datetime
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%m/%d")
+    except Exception:
+        return None
+
+def mc_upsert_member(
+    email: str,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    phone: str | None = None,
+    birthday: str | None = None,
+):
+    """
+    Add or update a list member (idempotent).
+    Uses status_if_new so we do NOT override unsubscribed users.
+    """
+    em = (email or "").strip()
+    if not em:
+        raise ValueError("email required")
+
+    h = mc_subscriber_hash(em)
+
+    fn = (first_name or "").strip()
+    ln = (last_name or "").strip()
+
+    merge: dict = {}
+
+    # If you marked FNAME/LNAME as REQUIRED in Mailchimp, uncomment these:
+    # if not fn: fn = "Member"
+    # if not ln: ln = ""
+
+    if fn:
+        merge["FNAME"] = fn[:80]
+    if ln:
+        merge["LNAME"] = ln[:80]
+
+    ph = mc_format_phone(phone)
+    if ph:
+        merge["PHONE"] = ph
+
+    bday = mc_format_birthday(birthday)
+    if bday:
+        merge["BIRTHDAY"] = bday
+
+    body = {
+        "email_address": em,
+        "status_if_new": "subscribed",
+    }
+
+    # ✅ don’t send merge_fields: {} (can trigger “invalid merge fields” on some lists)
+    if merge:
+        body["merge_fields"] = merge
+
+    return mc_request("PUT", f"/lists/{MAILCHIMP_AUDIENCE_ID}/members/{h}", json_body=body)
+
+def _to_simple_html(subject: str, message: str) -> str:
+    """
+    Create safe, simple HTML content + includes unsubscribe merge tag.
+    Mailchimp typically requires an unsubscribe link in campaigns.
+    """
+    safe_subject = html_lib.escape(subject or "")
+    safe_message = html_lib.escape(message or "").replace("\n", "<br/>")
+
+    return f"""
+<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; line-height: 1.45;">
+    <h2>{safe_subject}</h2>
+    <div>{safe_message}</div>
+    <hr/>
+    <p style="font-size:12px;color:#666;">
+      You can unsubscribe anytime:
+      <a href="*|UNSUB|*">Unsubscribe</a>
+    </p>
+  </body>
+</html>
+""".strip()
+
+def mc_create_campaign(subject: str, *, segment_id: int | None = None, from_name: str | None = None, reply_to: str | None = None):
+    """
+    Create a campaign that targets either:
+      - the whole audience (segment_id=None)
+      - a saved segment (segment_id provided)
+    """
+    from_name = (from_name or MAILCHIMP_FROM_NAME).strip()
+    reply_to = (reply_to or MAILCHIMP_REPLY_TO).strip()
+
+    recipients = {"list_id": MAILCHIMP_AUDIENCE_ID}
+    if segment_id is not None:
+        # recipients.segment_opts.saved_segment_id is the usual way to target a segment :contentReference[oaicite:4]{index=4}
+        recipients["segment_opts"] = {"saved_segment_id": int(segment_id)}
+
+    payload = {
+        "type": "regular",
+        "recipients": recipients,
+        "settings": {
+            "subject_line": subject,
+            "title": f"{subject} ({datetime.now(timezone.utc).isoformat()})",
+            "from_name": from_name,
+            "reply_to": reply_to,
+        },
+    }
+
+    # POST /campaigns :contentReference[oaicite:5]{index=5}
+    return mc_request("POST", "/campaigns", json_body=payload)
+
+def mc_set_campaign_content(campaign_id: str, subject: str, message: str):
+    html_body = _to_simple_html(subject, message)
+    payload = {"html": html_body}
+
+    # PUT /campaigns/{campaign_id}/content :contentReference[oaicite:6]{index=6}
+    return mc_request("PUT", f"/campaigns/{campaign_id}/content", json_body=payload)
+
+def mc_send_campaign(campaign_id: str):
+    # POST /campaigns/{campaign_id}/actions/send :contentReference[oaicite:7]{index=7}
+    return mc_request("POST", f"/campaigns/{campaign_id}/actions/send")
+
+def mc_create_static_segment(name: str, emails: list[str]) -> int:
+    """
+    Try creating a static segment with emails in one shot.
+    If Mailchimp rejects the payload (API differences/accounts), fallback to:
+      - create empty segment
+      - add members via segment members endpoint
+    """
+    emails = [e.strip() for e in emails if e and e.strip()]
+    if not emails:
+        raise ValueError("No emails provided for segment")
+
+    try:
+        # POST /lists/{list_id}/segments :contentReference[oaicite:8]{index=8}
+        seg = mc_request("POST", f"/lists/{MAILCHIMP_AUDIENCE_ID}/segments", json_body={
+            "name": name,
+            "static_segment": emails,
+        })
+        return int(seg["id"])
+    except Exception:
+        # fallback: create empty segment then add members
+        seg = mc_request("POST", f"/lists/{MAILCHIMP_AUDIENCE_ID}/segments", json_body={"name": name})
+        seg_id = int(seg["id"])
+
+        # Add members to segment (best-effort) :contentReference[oaicite:9]{index=9}
+        for e in emails:
+            try:
+                mc_request("POST", f"/lists/{MAILCHIMP_AUDIENCE_ID}/segments/{seg_id}/members", json_body={"email_address": e}, timeout=15)
+            except Exception as ex:
+                log.warning(f"[{getattr(g, '_rid', '-')}] segment add member failed {e}: {str(ex)[:160]}")
+        return seg_id
+
+def mc_delete_segment(seg_id: int):
+    try:
+        mc_request("DELETE", f"/lists/{MAILCHIMP_AUDIENCE_ID}/segments/{int(seg_id)}", timeout=15)
+    except Exception:
+        pass
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -2688,6 +2938,195 @@ def admin_recent_checkins():
         # ✅ This will show you EXACTLY where Errno 11 is thrown
         log.error(f"[{rid}] admin_recent_checkins failed: {e}", exc_info=True)
         return err(f"failed to load recent check-ins: {e}", 500)
+
+@app.get("/api/admin/mailchimp/health")
+@auth_required
+@admin_required
+def mailchimp_health():
+    if not _mailchimp_enabled():
+        return err("mailchimp not configured", 500)
+    return jsonify({
+        "ok": True,
+        "audience_id": MAILCHIMP_AUDIENCE_ID,
+        "server_prefix": MAILCHIMP_SERVER_PREFIX,
+        "from_name": MAILCHIMP_FROM_NAME,
+        "reply_to": MAILCHIMP_REPLY_TO,
+    })
+
+@app.post("/api/admin/mailchimp/sync-users")
+@auth_required
+@admin_required
+def mailchimp_sync_users():
+    """
+    Sync your Supabase users -> Mailchimp audience (adds/updates list members).
+    Body:
+      { "mode": "all" } OR { "mode": "selected", "user_ids": [...] }
+    """
+    try:
+        _mc_require()
+        body = request.get_json(force=True, silent=True) or {}
+        mode = (body.get("mode") or "all").lower()
+        user_ids = body.get("user_ids") or []
+
+        q = sb_admin.table("user_profiles").select("user_id,email,first_name,last_name,phone,birthday")
+
+        if mode == "selected":
+            if not isinstance(user_ids, list) or not user_ids:
+                return err("user_ids required for mode=selected", 400)
+            q = q.in_("user_id", user_ids)
+
+        rows = q.execute().data or []
+        rows = [r for r in rows if (r.get("email") or "").strip()]
+
+        synced = 0
+        failed = 0
+        failures: list[dict] = []
+
+        for r in rows:
+            em = (r.get("email") or "").strip()
+            try:
+                ph = str(r.get("phone")).strip() if r.get("phone") else None
+                bday = str(r.get("birthday")).strip() if r.get("birthday") else None
+
+                mc_upsert_member(
+                    email=em,
+                    first_name=(r.get("first_name") or "").strip() or None,
+                    last_name=(r.get("last_name") or "").strip() or None,
+                    phone=ph,
+                    birthday=bday,
+                )
+                synced += 1
+            except Exception as e:
+                failed += 1
+                failures.append({"email": em, "error": str(e)[:250]})
+                log.warning(
+                    f"[{getattr(g, '_rid', '-')}] mailchimp sync failed email={em}: {str(e)[:200]}"
+                )
+
+        out = {"ok": True, "mode": mode, "synced": synced, "failed": failed}
+        if failures:
+            out["failures"] = failures[:50]  # avoid huge payloads
+        return jsonify(out)
+
+    except Exception as e:
+        return err(f"sync failed: {e}", 500)
+
+@app.post("/api/admin/mailchimp/send")
+@auth_required
+@admin_required
+def mailchimp_send():
+    """
+    Send a Mailchimp campaign.
+    Body:
+      {
+        "mode": "all" | "selected",
+        "user_ids": ["..."] (required if selected),
+        "subject": "string",
+        "message": "string",
+        "from_name": "optional",
+        "reply_to": "optional",
+        "delete_segment_after": true|false (optional, default true)
+      }
+    """
+    try:
+        _mc_require()
+        body = request.get_json(force=True, silent=True) or {}
+
+        mode = (body.get("mode") or "all").lower()
+        subject = (body.get("subject") or "").strip()
+        message = (body.get("message") or "").strip()
+        from_name = (body.get("from_name") or "").strip() or None
+        reply_to = (body.get("reply_to") or "").strip() or None
+        delete_segment_after = body.get("delete_segment_after", True)
+
+        if mode not in ("all", "selected"):
+            return err("mode must be 'all' or 'selected'", 400)
+        if not subject:
+            return err("subject required", 400)
+        if not message:
+            return err("message required", 400)
+
+        segment_id = None
+        recipient_count = 0
+        failed_upserts: list[dict] = []
+
+        if mode == "selected":
+            user_ids = body.get("user_ids") or []
+            if not isinstance(user_ids, list) or not user_ids:
+                return err("user_ids required for mode=selected", 400)
+
+            rows = (
+                sb_admin.table("user_profiles")
+                .select("user_id,email,first_name,last_name,phone,birthday")
+                .in_("user_id", user_ids)
+                .execute()
+                .data
+            ) or []
+
+            emails: list[str] = []
+
+            for r in rows:
+                em = (r.get("email") or "").strip()
+                if not em:
+                    continue
+
+                try:
+                    ph = str(r.get("phone")).strip() if r.get("phone") else None
+                    bday = str(r.get("birthday")).strip() if r.get("birthday") else None
+
+                    mc_upsert_member(
+                        email=em,
+                        first_name=(r.get("first_name") or "").strip() or None,
+                        last_name=(r.get("last_name") or "").strip() or None,
+                        phone=ph,
+                        birthday=bday,
+                    )
+                    emails.append(em)
+                except Exception as e:
+                    failed_upserts.append({"email": em, "error": str(e)[:250]})
+                    continue
+
+            emails = sorted(set(emails))
+            if not emails:
+                first = failed_upserts[0] if failed_upserts else None
+                return err(f"no valid emails could be upserted. first_error={first}", 400)
+
+            recipient_count = len(emails)
+            seg_name = f"temp-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:6]}"
+            segment_id = mc_create_static_segment(seg_name, emails)
+
+        else:
+            # mode == "all"
+            recipient_count = -1
+
+        # ✅ Create campaign (works for BOTH all + selected)
+        camp = mc_create_campaign(subject, segment_id=segment_id, from_name=from_name, reply_to=reply_to)
+        campaign_id = camp.get("id")
+        if not campaign_id:
+            raise ValueError("Mailchimp did not return campaign id")
+
+        # ✅ Set content + send
+        mc_set_campaign_content(campaign_id, subject, message)
+        mc_send_campaign(campaign_id)
+
+        # ✅ Cleanup temporary segment if used
+        if segment_id is not None and delete_segment_after:
+            mc_delete_segment(segment_id)
+
+        resp = {
+            "ok": True,
+            "mode": mode,
+            "campaign_id": campaign_id,
+            "segment_id": segment_id,
+            "recipient_count": recipient_count,
+        }
+        if failed_upserts:
+            resp["failed_upserts"] = failed_upserts
+
+        return jsonify(resp)
+
+    except Exception as e:
+        return err(f"send failed: {e}", 500)
 
 
 # ───────────────────────── run server ──────────────────────────────
