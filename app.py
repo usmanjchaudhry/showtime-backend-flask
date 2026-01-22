@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from flask_cors import CORS
 from functools import wraps
 from werkzeug.exceptions import HTTPException
-
+from routes.admin import admin_bp
 import stripe
 
 from supabase import create_client, Client
@@ -349,7 +349,7 @@ def err(msg, code=400):
     log.warning(f"ERR {code}: {msg}")
     return make_response({"error": str(msg)}, code)
 
-
+app.register_blueprint(admin_bp, url_prefix='/api/admin')
 # ────────────────────────── request/response logs ──────────────────
 @app.before_request
 def _log_request_start():
