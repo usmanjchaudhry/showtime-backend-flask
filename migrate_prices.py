@@ -8,10 +8,10 @@ load_dotenv()
 
 # --- CONFIGURATION (EDIT THESE) ---
 # The OLD Price ID (the one people are currently subscribed to)
-OLD_STRIPE_PRICE_ID = 'price_1S1EG4LQmZaxf1vep5N1iY0x' 
+OLD_STRIPE_PRICE_ID = 'price_1Ss71ELQmZaxf1veAgOrsS2s' 
 
 # The NEW Price ID (the one you just created in Stripe Dashboard)
-NEW_STRIPE_PRICE_ID = 'price_1Ss9H7LQmZaxf1vefUpTpPmH' 
+NEW_STRIPE_PRICE_ID = 'price_1SsTChLQmZaxf1vePP9ryV4h' 
 
 # ----------------------------------
 
