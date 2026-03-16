@@ -107,17 +107,27 @@ def sync_user(user_id, customer_id, user_email):
                     except postgrest.exceptions.APIError as e:
                         if '23505' in str(e) or 'unique constraint' in str(e).lower():
                             print(f"      ⚠️ Plan exists but unlinked. Linking now...")
-                            orphan = sb_admin.table('user_memberships').select('id') \
-                                .eq('owner_user_id', user_id) \
-                                .eq('plan_id', plan_uuid) \
-                                .execute()
-                            if orphan.data:
-                                oid = orphan.data[0]['id']
-                                sb_admin.table('user_memberships').update({
-                                    'provider_subscription_id': sub_id,
-                                    'status': db_status
-                                }).eq('id', oid).execute()
-                                print(f"      🔗 Successfully linked existing plan to Stripe.")
+                            
+                            try:
+                                # FIX 1: Specifically look for the ACTIVE row that is missing the Stripe ID
+                                orphan = sb_admin.table('user_memberships').select('id') \
+                                    .eq('owner_user_id', user_id) \
+                                    .eq('plan_id', plan_uuid) \
+                                    .eq('status', 'active') \
+                                    .execute()
+                                
+                                if orphan.data:
+                                    oid = orphan.data[0]['id']
+                                    # FIX 2: Only update the subscription ID, leave status alone to avoid constraint errors
+                                    sb_admin.table('user_memberships').update({
+                                        'provider_subscription_id': sub_id
+                                    }).eq('id', oid).execute()
+                                    print(f"      🔗 Successfully linked existing plan to Stripe.")
+                                else:
+                                    print(f"      ❌ Orphan found, but could not safely link it.")
+                            except Exception as inner_error:
+                                # FIX 3: Catch any secondary database errors so the script DOES NOT CRASH
+                                print(f"      ❌ Failed to link orphan: {inner_error}")
                         else:
                             print(f"      ❌ Insert Failed: {e}")
         else:
