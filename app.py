@@ -3128,7 +3128,51 @@ def mailchimp_send():
     except Exception as e:
         return err(f"send failed: {e}", 500)
 
+# ───────────────────────── user: profile updates ──────────────────────
+# ───────────────────────── user: profile updates ──────────────────────
+@app.post("/api/user/update-phone")
+@auth_required
+def update_phone():
+    rid = getattr(g, "_rid", "-")
+    body = request.get_json(force=True, silent=True) or {}
+    
+    user_id = body.get('user_id')
+    phone = body.get('phone')
+    email = body.get('email')
+    first_name = body.get('first_name', '')
+    last_name = body.get('last_name', '')
+    sms_consent = body.get('sms_consent', False) # ✅ Catch the consent from React
 
+    if not user_id or not phone:
+        return err("Missing user ID or phone number", 400)
+        
+    if user_id != g.user_id:
+        return err("Forbidden: Cannot update another user's profile", 403)
+
+    try:
+        # 1. Save to Supabase WITH the timestamped audit trail
+        update_data = {'phone': phone}
+        if sms_consent:
+            update_data['sms_consent'] = True
+            update_data['sms_consent_at'] = datetime.now(timezone.utc).isoformat()
+
+        sb_admin.table('user_profiles').update(update_data).eq('user_id', user_id).execute()
+
+        # 2. Push to Mailchimp
+        if email:
+            mc_upsert_member(
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                phone=phone
+            )
+
+        log.info(f"[{rid}] Phone & consent updated successfully for {user_id}")
+        return jsonify({"status": "success", "phone": phone}), 200
+
+    except Exception as e:
+        log.error(f"[{rid}] Error updating phone: {e}")
+        return err(f"Failed to update phone: {e}", 500)
 # ───────────────────────── run server ──────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))

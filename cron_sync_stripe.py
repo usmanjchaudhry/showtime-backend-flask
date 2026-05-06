@@ -27,6 +27,7 @@ def to_utc_ts(sec: int):
 
 def sync_user(user_id, customer_id, user_email):
     try:
+        # READ-ONLY: We are only listing subscriptions, never creating charges.
         subs = stripe.Subscription.list(
             customer=customer_id,
             status='all',
@@ -68,70 +69,61 @@ def sync_user(user_id, customer_id, user_email):
         plan_uuid = plan_res.data[0]['id']
 
         # --- CHECK 1: STATUS SYNC ---
-        current_mem = sb_admin.table('user_memberships').select('id, status').eq('provider_subscription_id', sub_id).execute()
+        
+        # ✅ THE FIX: Look for the membership using the User ID and Plan ID.
+        # This guarantees we find the row to UPDATE it, rather than trying to INSERT a duplicate.
+        current_mem = sb_admin.table('user_memberships').select('id, status, provider_subscription_id') \
+            .eq('owner_user_id', user_id) \
+            .eq('plan_id', plan_uuid) \
+            .limit(1) \
+            .execute()
         
         if current_mem.data:
-            current_status = current_mem.data[0]['status']
+            # We found the existing row!
             existing_mem_id = current_mem.data[0]['id']
+            current_status = current_mem.data[0]['status']
+            current_sub_id = current_mem.data[0]['provider_subscription_id']
+            
+            # Does the status need updating OR does the Stripe ID need linking?
+            if current_status != db_status or current_sub_id != sub_id:
+                print(f"   🚩 [MISMATCH] {user_email} | {plan_name}")
+                print(f"      - DB: {current_status} -> Stripe: {db_status}")
+                
+                if not DRY_RUN:
+                    try:
+                        update_payload = {
+                            'status': db_status, 
+                            'provider_subscription_id': sub_id, # Ensure it is linked
+                            'updated_at': datetime.now(timezone.utc).isoformat()
+                        }
+                        sb_admin.table('user_memberships').update(update_payload).eq('id', existing_mem_id).execute()
+                        print(f"      ✅ Fixed DB status (Updated existing row).")
+                    except Exception as e:
+                        print(f"      ❌ Update Failed: {e}")
+            else:
+                print(f"   ✅ [OK] {user_email} is synced ({db_status})")
+                        
         else:
-            current_status = "DOES NOT EXIST"
-            existing_mem_id = None
-        
-        if current_status != db_status:
-            print(f"   🚩 [MISMATCH] {user_email} | {plan_name}")
-            print(f"      - DB: {current_status} -> Stripe: {db_status}")
+            # We truly do not have a row for this user and this plan. Safe to insert.
+            print(f"   🚩 [MISSING] {user_email} | {plan_name}")
+            print(f"      - DB: DOES NOT EXIST -> Stripe: {db_status}")
             
             if not DRY_RUN:
-                # Update existing row if found via Subscription ID
-                if existing_mem_id:
-                    update_payload = {
-                        'status': db_status, 
-                        'updated_at': datetime.now(timezone.utc).isoformat()
-                    }
-                    sb_admin.table('user_memberships').update(update_payload).eq('id', existing_mem_id).execute()
-                    print(f"      ✅ Fixed DB status (Updated).")
-                else:
-                    # Insert new - HANDLE CONFLICTS
-                    insert_payload = {
-                        'owner_user_id': user_id,
-                        'subject_user_id': user_id,
-                        'plan_id': plan_uuid,
-                        'provider_customer_id': customer_id,
-                        'provider_subscription_id': sub_id,
-                        'status': db_status,
-                        'updated_at': datetime.now(timezone.utc).isoformat()
-                    }
-                    try:
-                        sb_admin.table('user_memberships').insert(insert_payload).execute()
-                        print(f"      ✅ Fixed DB status (Inserted).")
-                    except postgrest.exceptions.APIError as e:
-                        if '23505' in str(e) or 'unique constraint' in str(e).lower():
-                            print(f"      ⚠️ Plan exists but unlinked. Linking now...")
-                            
-                            try:
-                                # FIX 1: Specifically look for the ACTIVE row that is missing the Stripe ID
-                                orphan = sb_admin.table('user_memberships').select('id') \
-                                    .eq('owner_user_id', user_id) \
-                                    .eq('plan_id', plan_uuid) \
-                                    .eq('status', 'active') \
-                                    .execute()
-                                
-                                if orphan.data:
-                                    oid = orphan.data[0]['id']
-                                    # FIX 2: Only update the subscription ID, leave status alone to avoid constraint errors
-                                    sb_admin.table('user_memberships').update({
-                                        'provider_subscription_id': sub_id
-                                    }).eq('id', oid).execute()
-                                    print(f"      🔗 Successfully linked existing plan to Stripe.")
-                                else:
-                                    print(f"      ❌ Orphan found, but could not safely link it.")
-                            except Exception as inner_error:
-                                # FIX 3: Catch any secondary database errors so the script DOES NOT CRASH
-                                print(f"      ❌ Failed to link orphan: {inner_error}")
-                        else:
-                            print(f"      ❌ Insert Failed: {e}")
-        else:
-            print(f"   ✅ [OK] {user_email} is synced ({db_status})")
+                insert_payload = {
+                    'owner_user_id': user_id,
+                    'subject_user_id': user_id,
+                    'plan_id': plan_uuid,
+                    'provider_customer_id': customer_id,
+                    'provider_subscription_id': sub_id,
+                    'status': db_status,
+                    'updated_at': datetime.now(timezone.utc).isoformat()
+                }
+                try:
+                    sb_admin.table('user_memberships').insert(insert_payload).execute()
+                    print(f"      ✅ Fixed DB status (Inserted new row).")
+                except Exception as e:
+                    print(f"      ❌ Insert Failed: {e}")
+
 
         # --- CHECK 2: ACCESS PERIODS ---
         if db_status == 'active':
@@ -141,6 +133,7 @@ def sync_user(user_id, customer_id, user_email):
             # 🚨 THE FALLBACK FIX: Grab dates from the latest invoice if Stripe hides them 🚨
             if not start_ts or not end_ts:
                 try:
+                    # READ-ONLY: Fetching invoice data, not generating an invoice.
                     invoices = stripe.Invoice.list(subscription=sub_id, limit=1)
                     if invoices.data and invoices.data[0].get("lines") and invoices.data[0]["lines"].get("data"):
                         period = invoices.data[0]["lines"]["data"][0].get("period", {})
