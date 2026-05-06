@@ -153,3 +153,8 @@ def record_checkin(*, subject_type: str, subject_id: str, method: str = "qr", lo
     rec = sb_admin.table("gym_checkins").insert(row).execute().data[0]
     rec["has_access_now"] = has_access_now_for_subject(rec.get("subject_user_id"), rec.get("dependent_id"))
     return rec
+
+def stripe_customer_dashboard_url(customer_id: str | None) -> str | None:
+    if not customer_id:
+        return None
+    return f"https://dashboard.stripe.com/customers/{customer_id}"

@@ -1,130 +1,41 @@
+# routes/admin.py
 import os
+import json
 import logging
 from datetime import datetime, timedelta, timezone, date
-from functools import wraps
-
+from typing import Dict, List
 import stripe
+import requests
 from flask import Blueprint, request, jsonify, g
 
-from dotenv import load_dotenv
-from supabase import create_client, Client
-from supabase.lib.client_options import SyncClientOptions as ClientOptions
+from core import (
+    sb_admin, err, log, auth_required, admin_required, _parse_ts, 
+    to_utc_ts, record_checkin, ensure_membership, stripe_customer_dashboard_url
+)
 
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-
-# ────────────────────────── setup ──────────────────────────
-load_dotenv()
-
-log = logging.getLogger("api.admin")
-
 admin_bp = Blueprint("admin", __name__)
 
-stripe.api_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
-
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE") or "").strip()
-ANON_KEY = (os.getenv("SUPABASE_ANON") or "").strip()
-
-# Reporting timezone for grouping daily results (change to your gym timezone if you want)
 REPORT_TZ_NAME = (os.getenv("REPORT_TZ") or "UTC").strip()
 if ZoneInfo:
-    try:
-        REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
-    except Exception:
-        REPORT_TZ_NAME = "UTC"
-        REPORT_TZ = timezone.utc
+    try: REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
+    except Exception: REPORT_TZ = timezone.utc
 else:
-    REPORT_TZ_NAME = "UTC"
     REPORT_TZ = timezone.utc
-
-if not (SUPABASE_URL and SERVICE_KEY):
-    log.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE is missing; admin auth will fail.")
-
-sb_admin: Client = create_client(
-    SUPABASE_URL,
-    SERVICE_KEY,
-    options=ClientOptions(auto_refresh_token=False, persist_session=False),
-)
-sb_public: Client = create_client(
-    SUPABASE_URL,
-    ANON_KEY or SERVICE_KEY,
-    options=ClientOptions(auto_refresh_token=False, persist_session=False),
-)
-
-
-def _err(msg: str, code: int = 400):
-    return jsonify({"error": str(msg)}), code
-
-
-def _bearer_token() -> str | None:
-    auth = request.headers.get("Authorization", "") or ""
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return None
-
-
-def auth_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        tok = _bearer_token()
-        if not tok:
-            return _err("missing bearer token", 401)
-        try:
-            res = sb_public.auth.get_user(tok)
-            user = res.user
-            if not user:
-                return _err("invalid token", 401)
-            g.user_id = user.id
-            g.user_email = user.email
-        except Exception as e:
-            return _err(f"invalid token: {e}", 401)
-        return fn(*args, **kwargs)
-    return wrapper
-
-
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        uid = getattr(g, "user_id", None)
-        if not uid:
-            return _err("unauthorized", 401)
-
-        try:
-            rows = (
-                sb_admin.table("user_profiles")
-                .select("is_admin")
-                .eq("user_id", uid)
-                .limit(1)
-                .execute()
-                .data
-            )
-            is_admin = bool(rows and rows[0].get("is_admin"))
-        except Exception as e:
-            return _err(f"admin check failed: {e}", 500)
-
-        if not is_admin:
-            return _err("forbidden", 403)
-
-        return fn(*args, **kwargs)
-    return wrapper
-
 
 # ────────────────────────── date helpers ──────────────────────────
 def _parse_yyyy_mm_dd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
-
 def _start_of_day(d: date) -> datetime:
     return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=REPORT_TZ)
 
-
 def _end_of_day_inclusive(d: date) -> datetime:
     return _start_of_day(d + timedelta(days=1)) - timedelta(microseconds=1)
-
 
 def _daterange(start_d: date, end_d: date):
     cur = start_d
@@ -132,23 +43,14 @@ def _daterange(start_d: date, end_d: date):
         yield cur
         cur = cur + timedelta(days=1)
 
-
 def _compute_range(period: str | None, start_str: str | None, end_str: str | None):
     now = datetime.now(REPORT_TZ)
     period = (period or "30d").lower().strip()
 
-    # Custom range takes priority if provided
     if start_str and end_str:
-        s = _parse_yyyy_mm_dd(start_str)
-        e = _parse_yyyy_mm_dd(end_str)
-        if s > e:
-            raise ValueError("start must be <= end")
-
-        start_dt = _start_of_day(s)
-        end_dt = _end_of_day_inclusive(e)
-        if end_dt > now:
-            end_dt = now
-
+        s, e = _parse_yyyy_mm_dd(start_str), _parse_yyyy_mm_dd(end_str)
+        if s > e: raise ValueError("start must be <= end")
+        start_dt, end_dt = _start_of_day(s), min(_end_of_day_inclusive(e), now)
         return ("custom", start_dt, end_dt, f"{s.isoformat()} → {end_dt.date().isoformat()}")
 
     if period == "today":
@@ -156,7 +58,6 @@ def _compute_range(period: str | None, start_str: str | None, end_str: str | Non
         return ("today", _start_of_day(d), now, d.isoformat())
 
     if period == "7d":
-        # inclusive: today + previous 6 calendar days
         start_dt = _start_of_day((now - timedelta(days=6)).date())
         return ("7d", start_dt, now, f"{start_dt.date().isoformat()} → {now.date().isoformat()}")
 
@@ -168,154 +69,218 @@ def _compute_range(period: str | None, start_str: str | None, end_str: str | Non
         start_dt = datetime(now.year, 1, 1, 0, 0, 0, tzinfo=REPORT_TZ)
         return ("ytd", start_dt, now, f"{start_dt.date().isoformat()} → {now.date().isoformat()}")
 
-    # default 30d inclusive: today + previous 29 calendar days
     start_dt = _start_of_day((now - timedelta(days=29)).date())
     return ("30d", start_dt, now, f"{start_dt.date().isoformat()} → {now.date().isoformat()}")
 
-
 # ────────────────────────── revenue endpoint ──────────────────────────
-@admin_bp.route("/revenue", methods=["GET"])
+@admin_bp.get("/api/admin/revenue")
 @auth_required
 @admin_required
 def get_revenue():
-    if not stripe.api_key:
-        return _err("Stripe not configured (STRIPE_SECRET_KEY missing)", 500)
+    if not stripe.api_key: return err("Stripe not configured", 500)
 
     period = request.args.get("period", "30d")
-    start_str = request.args.get("start")  # YYYY-MM-DD
-    end_str = request.args.get("end")      # YYYY-MM-DD
+    start_str, end_str = request.args.get("start"), request.args.get("end")
 
-    try:
-        resolved_period, start_dt, end_dt, label = _compute_range(period, start_str, end_str)
-    except Exception as e:
-        return _err(f"Invalid date range: {e}", 400)
+    try: resolved_period, start_dt, end_dt, label = _compute_range(period, start_str, end_str)
+    except Exception as e: return err(f"Invalid date range: {e}", 400)
 
-    start_ts = int(start_dt.timestamp())
-    end_ts = int(end_dt.timestamp())
-
-    # Pre-fill days so UI always gets continuous rows (including $0 days)
     daily = {
         d.isoformat(): {
-            "date": d.isoformat(),
-            "gross_cents": 0,       # charges before fees
-            "fees_cents": 0,        # stripe fees
-            "refunds_cents": 0,     # refunded amount (positive)
-            "net_cents": 0,         # after fees & refunds
-            "charges_count": 0,
-            "refunds_count": 0,
-        }
-        for d in _daterange(start_dt.date(), end_dt.date())
+            "date": d.isoformat(), "gross_cents": 0, "fees_cents": 0, "refunds_cents": 0,
+            "net_cents": 0, "charges_count": 0, "refunds_count": 0,
+        } for d in _daterange(start_dt.date(), end_dt.date())
     }
 
-    total_gross = 0
-    total_fees = 0
-    total_refunds = 0
-    total_net = 0
-    charges_count = 0
-    refunds_count = 0
+    total_gross = total_fees = total_refunds = total_net = charges_count = refunds_count = 0
+    currencies, ignored_categories = set(), {}
 
-    currencies = set()
-    ignored_categories: dict[str, int] = {}
-
-    # We use Balance Transactions because they contain fee + net fields.
-    # This is the best way to compute “revenue after Stripe fees”.
     try:
-        bts = stripe.BalanceTransaction.list(
-            created={"gte": start_ts, "lte": end_ts},
-            limit=100,
-        )
-
+        bts = stripe.BalanceTransaction.list(created={"gte": int(start_dt.timestamp()), "lte": int(end_dt.timestamp())}, limit=100)
         for bt in bts.auto_paging_iter():
             cat = (bt.get("reporting_category") or bt.get("type") or "").lower().strip()
-            amount = int(bt.get("amount") or 0)  # may be negative (refunds)
-            fee = int(bt.get("fee") or 0)
-            net = int(bt.get("net") or 0)
-            currency = (bt.get("currency") or "usd").upper()
-            currencies.add(currency)
+            amount, fee, net = int(bt.get("amount") or 0), int(bt.get("fee") or 0), int(bt.get("net") or 0)
+            currencies.add((bt.get("currency") or "usd").upper())
 
-            created = int(bt.get("created") or 0)
-            day_key = datetime.fromtimestamp(created, tz=timezone.utc).astimezone(REPORT_TZ).date().isoformat()
+            day_key = datetime.fromtimestamp(int(bt.get("created") or 0), tz=timezone.utc).astimezone(REPORT_TZ).date().isoformat()
             if day_key not in daily:
-                daily[day_key] = {
-                    "date": day_key,
-                    "gross_cents": 0,
-                    "fees_cents": 0,
-                    "refunds_cents": 0,
-                    "net_cents": 0,
-                    "charges_count": 0,
-                    "refunds_count": 0,
-                }
+                daily[day_key] = {"date": day_key, "gross_cents": 0, "fees_cents": 0, "refunds_cents": 0, "net_cents": 0, "charges_count": 0, "refunds_count": 0}
 
-            # We only count charge + refund categories in “revenue”
             if cat in ("charge", "payment"):
                 daily[day_key]["gross_cents"] += amount
                 daily[day_key]["fees_cents"] += fee
                 daily[day_key]["net_cents"] += net
                 daily[day_key]["charges_count"] += 1
-
-                total_gross += amount
-                total_fees += fee
-                total_net += net
-                charges_count += 1
-
+                total_gross += amount; total_fees += fee; total_net += net; charges_count += 1
             elif cat in ("refund",):
-                # refund amount is negative in Stripe; we store refunds as POSITIVE for display
                 daily[day_key]["refunds_cents"] += abs(amount)
-                daily[day_key]["fees_cents"] += fee       # fee may be 0 or negative (fee refunded)
-                daily[day_key]["net_cents"] += net        # net should be negative
+                daily[day_key]["fees_cents"] += fee
+                daily[day_key]["net_cents"] += net
                 daily[day_key]["refunds_count"] += 1
-
-                total_refunds += abs(amount)
-                total_fees += fee
-                total_net += net
-                refunds_count += 1
-
+                total_refunds += abs(amount); total_fees += fee; total_net += net; refunds_count += 1
             else:
                 ignored_categories[cat or "unknown"] = ignored_categories.get(cat or "unknown", 0) + 1
 
         currency_out = "MIXED" if len(currencies) > 1 else (next(iter(currencies)) if currencies else "USD")
-
-        breakdown = []
-        for _, v in sorted(daily.items()):
-            breakdown.append({
-                "date": v["date"],
-                "gross": v["gross_cents"] / 100,
-                "fees": v["fees_cents"] / 100,
-                "refunds": v["refunds_cents"] / 100,
-                "net": v["net_cents"] / 100,
-                "charges_count": v["charges_count"],
-                "refunds_count": v["refunds_count"],
-            })
-
-        days = (end_dt.date() - start_dt.date()).days + 1
-        generated_at = datetime.now(timezone.utc).isoformat()
+        breakdown = [{"date": v["date"], "gross": v["gross_cents"] / 100, "fees": v["fees_cents"] / 100, "refunds": v["refunds_cents"] / 100, "net": v["net_cents"] / 100, "charges_count": v["charges_count"], "refunds_count": v["refunds_count"]} for _, v in sorted(daily.items())]
 
         return jsonify({
-            "ok": True,
-            "period": resolved_period,
-            "currency": currency_out,
-            "range": {
-                "label": label,
-                "start": start_dt.date().isoformat(),
-                "end": end_dt.date().isoformat(),
-                "timezone": REPORT_TZ_NAME,
-                "days": days,
-                "generated_at": generated_at,
-            },
-            "totals": {
-                "gross": total_gross / 100,
-                "fees": total_fees / 100,
-                "refunds": total_refunds / 100,
-                "net": total_net / 100,  # ✅ THIS IS “after Stripe fees”
-                "charges_count": charges_count,
-                "refunds_count": refunds_count,
-            },
-            "breakdown": breakdown,
-            "meta": {
-                "ignored_categories": ignored_categories,  # transparency if Stripe has disputes/payout rows in range
-            }
+            "ok": True, "period": resolved_period, "currency": currency_out,
+            "range": {"label": label, "start": start_dt.date().isoformat(), "end": end_dt.date().isoformat(), "timezone": REPORT_TZ_NAME, "days": (end_dt.date() - start_dt.date()).days + 1, "generated_at": datetime.now(timezone.utc).isoformat()},
+            "totals": {"gross": total_gross / 100, "fees": total_fees / 100, "refunds": total_refunds / 100, "net": total_net / 100, "charges_count": charges_count, "refunds_count": refunds_count},
+            "breakdown": breakdown, "meta": {"ignored_categories": ignored_categories}
         })
-
     except Exception as e:
         log.exception("Stripe revenue error")
-        return _err(f"Stripe Error: {e}", 500)
+        return err(f"Stripe Error: {e}", 500)
+
+# ────────────────────────── admin manual overrides ──────────────────────────
+@admin_bp.post("/api/admin/checkins")
+@auth_required
+@admin_required
+def admin_checkin():
+    body = request.get_json(force=True, silent=True) or {}
+    subject_type, subject_id = (body.get("subject_type") or "user").lower(), body.get("subject_id")
+    if subject_type not in ("user", "dependent") or not subject_id: return err("subject_type and subject_id required", 400)
+
+    rec = record_checkin(subject_type=subject_type, subject_id=subject_id, method=body.get("method") or "admin", location=body.get("location"), source=body.get("source") or f"admin:{g.user_id}", meta=body.get("meta") or {})
+    return jsonify({"ok": True, "checkin": rec})
+
+@admin_bp.post("/api/admin/periods")
+@auth_required
+@admin_required
+def admin_add_period():
+    body = request.get_json(force=True, silent=True) or {}
+    user_membership_id, owner_user_id = body.get("user_membership_id"), (body.get("owner_user_id") or g.user_id)
+    subject_type, subject_id = (body.get("subject_type") or "user").lower(), body.get("subject_id")
+    plan_id, period_start_iso, period_end_iso = (body.get("plan_id") or "").strip(), body.get("period_start"), body.get("period_end")
+
+    if not plan_id or not period_start_iso or not period_end_iso: return err("period_start, period_end, plan_id required", 400)
+    try: ps, pe = _parse_ts(period_start_iso), _parse_ts(period_end_iso)
+    except Exception: return err("Invalid datetime format", 400)
+    if ps >= pe: return err("period_start must be before period_end", 400)
+
+    try:
+        mem = sb_admin.table("user_memberships").select("*").eq("id", user_membership_id).limit(1).execute().data[0] if user_membership_id else None
+        if not mem: mem = ensure_membership(owner_user_id=owner_user_id, plan_id=plan_id, subject_user_id=(owner_user_id if subject_type == "user" else None), dependent_id=(subject_id if subject_type == "dependent" else None), status="active")
+        ins = sb_admin.table("membership_periods").insert({"user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"], "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"), "plan_id": mem["plan_id"], "source": "manual", "period_start": ps.isoformat(), "period_end": pe.isoformat()}).execute().data[0]
+        sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
+        return jsonify({"ok": True, "membership_period_id": ins["id"]})
+    except Exception as e: return err(f"Operation failed: {e}", 400)
+
+# ───────────────────────── admin: users overview & checkins ───────────────────
+@admin_bp.get("/api/admin/users/overview")
+@auth_required
+@admin_required
+def admin_users_overview():
+    now = datetime.now(timezone.utc)
+    try:
+        users = sb_admin.table("user_profiles").select("user_id,email,first_name,last_name,stripe_customer_id").order("first_name", desc=False).execute().data
+        owner_ids = [u["user_id"] for u in users if u.get("user_id")]
+
+        memberships = sb_admin.table("user_memberships").select("id,owner_user_id,subject_user_id,dependent_id,plan_id,status").in_("owner_user_id", owner_ids).execute().data if owner_ids else []
+        plans = {p["id"]: p for p in sb_admin.table("membership_plans").select("id,name,price_cents,currency,interval,interval_count").in_("id", list({m["plan_id"] for m in memberships})).execute().data} if memberships else {}
+
+        periods_by_owner = {oid: [] for oid in owner_ids}
+        if owner_ids:
+            for r in sb_admin.table("membership_periods").select("owner_user_id,period_start,period_end").in_("owner_user_id", owner_ids).eq("is_voided", False).execute().data:
+                periods_by_owner.setdefault(r["owner_user_id"], []).append(r)
+
+        def active_now(periods):
+            for pr in periods or []:
+                try:
+                    if _parse_ts(pr["period_start"]) <= now < _parse_ts(pr["period_end"]): return True
+                except Exception: continue
+            return False
+
+        last_checkin_by_subject = {row["subject_user_id"]: row["scanned_at"] for row in sb_admin.table("gym_checkins").select("subject_user_id,scanned_at").in_("subject_user_id", owner_ids).order("scanned_at", desc=True).execute().data} if owner_ids else {}
+
+        active_w = sb_admin.table("waivers").select("id,version").eq("is_active", True).eq("required_for_purchase", True).limit(1).execute().data
+        waiver_required = bool(active_w)
+        signed_subjects = {s["subject_user_id"] for s in sb_admin.table("waiver_signatures").select("subject_user_id").eq("waiver_id", active_w[0]["id"]).eq("waiver_version", active_w[0]["version"]).is_("revoked_at", "null").in_("subject_user_id", owner_ids).execute().data} if waiver_required and owner_ids else set()
+
+        mems_by_owner = {}
+        for m in memberships: mems_by_owner.setdefault(m["owner_user_id"], []).append(m)
+
+        out_rows = [{
+            "user_id": u["user_id"], "email": u.get("email"), "first_name": u.get("first_name"), "last_name": u.get("last_name"),
+            "last_checkin_at": last_checkin_by_subject.get(u["user_id"]), "has_access_now": active_now(periods_by_owner.get(u["user_id"], [])),
+            "waiver_required": waiver_required, "waiver_signed": (u["user_id"] in signed_subjects) if waiver_required else None,
+            "memberships": [{"id": m["id"], "status": m.get("status"), "plan": plans.get(m.get("plan_id"))} for m in mems_by_owner.get(u["user_id"], [])],
+            "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id"))
+        } for u in users]
+
+        return jsonify({"users": out_rows, "count": len(out_rows)})
+    except Exception as e: return err(f"admin overview failed: {e}", 500)
+
+@admin_bp.get("/api/admin/checkins/recent")
+@auth_required
+@admin_required
+def admin_recent_checkins():
+    try:
+        limit, since_min = min(max(int(request.args.get("limit", "50")), 1), 200), int(request.args.get("since_min", "0"))
+        q = sb_admin.table("gym_checkins").select("id,subject_user_id,dependent_id,scanned_at,method,location,source,meta").order("scanned_at", desc=True).limit(limit)
+        if since_min > 0: q = q.gte("scanned_at", (datetime.now(timezone.utc) - timedelta(minutes=since_min)).isoformat())
+        
+        rows = q.execute().data or []
+        user_ids = sorted({r.get("subject_user_id") for r in rows if r.get("subject_user_id")})
+        users_by_id = {u["user_id"]: u for u in sb_admin.table("user_profiles").select("user_id,first_name,last_name,email").in_("user_id", user_ids).execute().data} if user_ids else {}
+
+        items = []
+        for r in rows:
+            su = r.get("subject_user_id")
+            if su:
+                prof = users_by_id.get(su, {})
+                label = f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip() or prof.get("email") or "Member"
+                items.append({"id": r["id"], "scanned_at": r.get("scanned_at"), "method": r.get("method"), "location": r.get("location"), "subject_type": "user", "subject_id": su, "subject_label": label, "email": prof.get("email")})
+
+        return jsonify({"items": items, "count": len(items)})
+    except Exception as e: return err(f"failed to load recent check-ins: {e}", 500)
+
+# ────────────────────────── Mailchimp Sync Tools ──────────────────────────
+MAILCHIMP_API_KEY = (os.getenv("MAILCHIMP_API_KEY") or "").strip()
+MAILCHIMP_AUDIENCE_ID = (os.getenv("MAILCHIMP_AUDIENCE_ID") or "").strip()
+MAILCHIMP_SERVER_PREFIX = (os.getenv("MAILCHIMP_SERVER_PREFIX") or "").strip()
+if MAILCHIMP_API_KEY and not MAILCHIMP_SERVER_PREFIX and "-" in MAILCHIMP_API_KEY: MAILCHIMP_SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1].strip()
+MAILCHIMP_BASE_URL = f"https://{MAILCHIMP_SERVER_PREFIX}.api.mailchimp.com/3.0" if MAILCHIMP_SERVER_PREFIX else ""
+
+def _mailchimp_enabled() -> bool: return bool(MAILCHIMP_API_KEY and MAILCHIMP_AUDIENCE_ID and MAILCHIMP_SERVER_PREFIX)
+
+def mc_request(method: str, path: str, *, json_body=None):
+    if not _mailchimp_enabled(): return {}
+    r = requests.request(method.upper(), f"{MAILCHIMP_BASE_URL}{path}", json=json_body, auth=("anystring", MAILCHIMP_API_KEY), timeout=25)
+    if r.status_code >= 400: raise ValueError(f"mailchimp {r.status_code}: {r.text}")
+    return r.json() if r.text else {}
+
+@admin_bp.get("/api/admin/mailchimp/health")
+@auth_required
+@admin_required
+def mailchimp_health():
+    if not _mailchimp_enabled(): return err("mailchimp not configured", 500)
+    return jsonify({"ok": True, "audience_id": MAILCHIMP_AUDIENCE_ID, "server_prefix": MAILCHIMP_SERVER_PREFIX})
+
+@admin_bp.post("/api/admin/mailchimp/sync-users")
+@auth_required
+@admin_required
+def mailchimp_sync_users():
+    body = request.get_json(force=True, silent=True) or {}
+    mode, user_ids = (body.get("mode") or "all").lower(), body.get("user_ids") or []
+
+    q = sb_admin.table("user_profiles").select("user_id,email,first_name,last_name,phone")
+    if mode == "selected" and user_ids: q = q.in_("user_id", user_ids)
+    
+    synced, failed = 0, 0
+    for r in q.execute().data or []:
+        em = (r.get("email") or "").strip()
+        if not em: continue
+        try:
+            import hashlib
+            h = hashlib.md5(em.lower().encode("utf-8")).hexdigest()
+            payload = {"email_address": em, "status_if_new": "subscribed", "merge_fields": {}}
+            if r.get("first_name"): payload["merge_fields"]["FNAME"] = r.get("first_name")
+            if r.get("last_name"): payload["merge_fields"]["LNAME"] = r.get("last_name")
+            mc_request("PUT", f"/lists/{MAILCHIMP_AUDIENCE_ID}/members/{h}", json_body=payload)
+            synced += 1
+        except Exception: failed += 1
+
+    return jsonify({"ok": True, "synced": synced, "failed": failed})
