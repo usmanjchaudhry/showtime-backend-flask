@@ -3,10 +3,9 @@ import stripe
 from flask import Blueprint, request, jsonify, g
 from datetime import datetime, timezone
 
-# ✅ Import shared tools and database connections from core.py
 from core import (
     sb_admin, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL,
-    err, log, auth_required, to_utc_ts, add_interval, ensure_membership
+    err, log, auth_required, add_interval, ensure_membership
 )
 
 checkout_bp = Blueprint('checkout', __name__)
@@ -57,7 +56,8 @@ def ensure_one_time_period_from_meta(meta: dict, *, external_id: str, created_ts
 
     created_period = False
     if not exists:
-        start = to_utc_ts(created_ts) if created_ts else datetime.now(timezone.utc)
+        # ✅ FIX: Safely convert Stripe's Unix integer timestamp
+        start = datetime.fromtimestamp(int(created_ts), tz=timezone.utc) if created_ts else datetime.now(timezone.utc)
         end = add_interval(start, plan.get("interval") or "day", plan.get("interval_count") or 1)
 
         sb_admin.table("membership_periods").insert({
@@ -68,8 +68,8 @@ def ensure_one_time_period_from_meta(meta: dict, *, external_id: str, created_ts
             "plan_id": mem["plan_id"],
             "source": "stripe",
             "source_ref": external_id,
-            "period_start": start.isoformat(), # ✅ Fixed
-            "period_end": end.isoformat(),     # ✅ Fixed
+            "period_start": start.isoformat(),
+            "period_end": end.isoformat(),
         }).execute()
         created_period = True
 
@@ -77,18 +77,11 @@ def ensure_one_time_period_from_meta(meta: dict, *, external_id: str, created_ts
         rec_existing = sb_admin.table("payment_receipts").select("id").eq("source", "stripe").eq("external_id", external_id).limit(1).execute().data
         if not rec_existing:
             sb_admin.table("payment_receipts").insert({
-                "user_membership_id": mem["id"],
-                "owner_user_id": mem["owner_user_id"],
-                "subject_user_id": mem.get("subject_user_id"),
-                "dependent_id": mem.get("dependent_id"),
-                "plan_id": mem["plan_id"],
-                "source": "stripe",
-                "external_type": "checkout_session",
-                "external_id": external_id,
-                "status": "succeeded",
-                "amount_cents": int(amount_total or 0),
-                "currency": (currency or "USD").upper(),
-                "paid_at": datetime.now(timezone.utc).isoformat(),
+                "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
+                "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"),
+                "plan_id": mem["plan_id"], "source": "stripe", "external_type": "checkout_session",
+                "external_id": external_id, "status": "succeeded", "amount_cents": int(amount_total or 0),
+                "currency": (currency or "USD").upper(), "paid_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
 
     sb_admin.table("user_memberships").update({"status": "active"}).eq("id", mem["id"]).execute()
@@ -101,15 +94,12 @@ def checkout_session_info():
     sid = (request.args.get("session_id") or "").strip()
     if not sid: return err("session_id required", 400)
 
-    try:
-        sess = stripe.checkout.Session.retrieve(sid)
-    except Exception as e:
-        return err(f"invalid session_id: {e}", 400)
+    try: sess = stripe.checkout.Session.retrieve(sid)
+    except Exception as e: return err(f"invalid session_id: {e}", 400)
 
     md = (sess.get("metadata") or {}) if isinstance(sess, dict) else getattr(sess, "metadata", {}) or {}
     owner_user_id = md.get("owner_user_id")
-    if owner_user_id and owner_user_id != g.user_id:
-        return err("forbidden", 403)
+    if owner_user_id and owner_user_id != g.user_id: return err("forbidden", 403)
 
     plan_id = md.get("plan_id")
     plan = None
@@ -244,8 +234,9 @@ def checkout_finalize():
                     "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
                     "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"),
                     "plan_id": mem["plan_id"], "source": "stripe", "source_ref": src_ref,
-                    "period_start": to_utc_ts(int(start_ts)).isoformat(), # ✅ Fixed
-                    "period_end": to_utc_ts(int(end_ts)).isoformat(),     # ✅ Fixed
+                    # ✅ FIX: Safely parse Stripe Timestamps
+                    "period_start": datetime.fromtimestamp(int(start_ts), tz=timezone.utc).isoformat(),
+                    "period_end": datetime.fromtimestamp(int(end_ts), tz=timezone.utc).isoformat(),
                 }).execute()
                 created_period = True
 
@@ -269,10 +260,14 @@ def checkout_finalize():
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET: return err("webhook not configured", 500)
 
-    payload = request.data
+    # ✅ FIX: Use get_data() to preserve raw byte string for signature validation
+    payload = request.get_data(as_text=True)
     sig = request.headers.get("Stripe-Signature", "")
-    try: event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception as e: return err(f"webhook signature failed: {e}", 400)
+    try: 
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e: 
+        log.error(f"Webhook signature failed: {e}")
+        return err(f"webhook signature failed: {e}", 400)
 
     etype = event["type"]
     log.info(f"Stripe Webhook Event: {etype}")
@@ -304,8 +299,9 @@ def stripe_webhook():
                             "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
                             "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"),
                             "plan_id": mem["plan_id"], "source": "stripe", "source_ref": src_ref,
-                            "period_start": to_utc_ts(int(start_ts)).isoformat(), # ✅ Fixed
-                            "period_end": to_utc_ts(int(end_ts)).isoformat(),     # ✅ Fixed
+                            # ✅ FIX: Safely parse Stripe Timestamps
+                            "period_start": datetime.fromtimestamp(int(start_ts), tz=timezone.utc).isoformat(),
+                            "period_end": datetime.fromtimestamp(int(end_ts), tz=timezone.utc).isoformat(),
                         }).execute()
             except Exception as e:
                 log.warning(f"could not seed period from subscription: {e}")
@@ -334,8 +330,9 @@ def stripe_webhook():
                 "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
                 "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"),
                 "plan_id": mem["plan_id"], "source": "stripe", "source_ref": invoice_id,
-                "period_start": to_utc_ts(start_ts).isoformat(), # ✅ Fixed
-                "period_end": to_utc_ts(end_ts).isoformat(),     # ✅ Fixed
+                # ✅ FIX: Safely parse Stripe Timestamps
+                "period_start": datetime.fromtimestamp(int(start_ts), tz=timezone.utc).isoformat(),
+                "period_end": datetime.fromtimestamp(int(end_ts), tz=timezone.utc).isoformat(),
             }).execute()
 
         rec_existing = sb_admin.table("payment_receipts").select("id").eq("source", "stripe").eq("external_id", invoice_id).limit(1).execute().data
@@ -359,7 +356,8 @@ def stripe_webhook():
     if etype in ("customer.subscription.deleted",):
         sub = event["data"]["object"]
         patch = {"status": "canceled"}
-        if sub.get("current_period_end"): patch["current_period_end"] = to_utc_ts(sub.get("current_period_end")).isoformat()
+        if sub.get("current_period_end"): 
+            patch["current_period_end"] = datetime.fromtimestamp(int(sub.get("current_period_end")), tz=timezone.utc).isoformat()
         sb_admin.table("user_memberships").update(patch).eq("provider_subscription_id", sub.get("id")).execute()
         return jsonify({"ok": True})
 
