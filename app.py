@@ -25,7 +25,6 @@ CORS_ORIGINS = [
     FRONTEND_URL
 ]
 
-# ✅ Fix: Use "/*" to catch all requests and prevent 404 CORS masking
 CORS(
     app,
     resources={r"/*": {"origins": CORS_ORIGINS}},
