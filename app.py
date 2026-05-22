@@ -22,6 +22,7 @@ CORS_ORIGINS = [
     "http://localhost:5173", 
     "https://showtime-front-end.vercel.app",
     "https://www.showtimeboxinggym.com", 
+    "https://showtimeboxinggym.com",
     FRONTEND_URL
 ]
 
