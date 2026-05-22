@@ -95,6 +95,21 @@ def sync_stripe_for_user(user_id: str, *, min_age_seconds: int = 300, force: boo
                     notes.append(f"no plan for price_id={price_id}")
                     continue
 
+                # 🛡️ THE CASH SHIELD: Prevent Stripe from downgrading an active cash user during QR Scan
+                if mapped_status != "active":
+                    try:
+                        mem_check = sb_admin.table("user_memberships").select("payment_provider, current_period_end").eq("owner_user_id", user_id).eq("plan_id", plan["id"]).execute().data
+                        if mem_check:
+                            provider = mem_check[0].get("payment_provider")
+                            pend = mem_check[0].get("current_period_end")
+                            if provider == "cash" and pend:
+                                pend_dt = datetime.fromisoformat(pend.replace("Z", "+00:00"))
+                                if pend_dt > datetime.now(timezone.utc):
+                                    mapped_status = "active" # Override Stripe
+                                    notes.append("Shielded cash payment from Stripe downgrade")
+                    except Exception as e:
+                        log.warning(f"Cash shield error: {e}")
+
                 mem = ensure_membership(
                     owner_user_id=user_id, plan_id=plan["id"], subject_user_id=user_id,
                     dependent_id=None, provider_customer_id=customer_id,
@@ -111,12 +126,12 @@ def sync_stripe_for_user(user_id: str, *, min_age_seconds: int = 300, force: boo
                                 "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
                                 "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"),
                                 "plan_id": mem["plan_id"], "source": "stripe", "source_ref": src_ref,
-                                "period_start": to_utc_ts(int(start_ts)).isoformat(), # ✅ Fixed
-                                "period_end": to_utc_ts(int(end_ts)).isoformat()      # ✅ Fixed
+                                "period_start": to_utc_ts(int(start_ts)).isoformat(),
+                                "period_end": to_utc_ts(int(end_ts)).isoformat()
                             }).execute()
                             created_periods += 1
                         except Exception as e:
-                            notes.append(f"period insert failed (maybe duplicate): {str(e)[:120]}")
+                            notes.append(f"period insert failed: {str(e)[:120]}")
 
         _STRIPE_SYNC_LAST[user_id] = time.time()
         return {
