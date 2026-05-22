@@ -194,12 +194,20 @@ def admin_add_period():
     try: ps, pe = _parse_ts(period_start_iso), _parse_ts(period_end_iso)
     except Exception: return err("Invalid datetime format", 400)
     if ps >= pe: return err("period_start must be before period_end", 400)
+    
     try:
         mem = sb_admin.table("user_memberships").select("*").eq("id", user_membership_id).limit(1).execute().data[0] if user_membership_id else None
         if not mem: mem = ensure_membership(owner_user_id=owner_user_id, plan_id=plan_id, subject_user_id=(owner_user_id if subject_type == "user" else None), dependent_id=(subject_id if subject_type == "dependent" else None), status="active")
-        ins = sb_admin.table("membership_periods").insert({"user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"], "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"), "plan_id": mem["plan_id"], "source": "manual", "period_start": ps.isoformat(), "period_end": pe.isoformat()}).execute().data[0]
         
-        # ✅ FIX: Mark payment provider as manual/cash
+        # 1. Insert Door Scanner Ticket
+        ins = sb_admin.table("membership_periods").insert({
+            "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"], 
+            "subject_user_id": mem.get("subject_user_id"), "dependent_id": mem.get("dependent_id"), 
+            "plan_id": mem["plan_id"], "source": "manual", "period_start": ps.isoformat(), 
+            "period_end": pe.isoformat()
+        }).execute().data[0]
+        
+        # 2. Update Master Folder and explicitly mark as Cash
         sb_admin.table("user_memberships").update({
             "status": "active",
             "payment_provider": "cash",
@@ -207,7 +215,7 @@ def admin_add_period():
             "current_period_end": pe.isoformat()
         }).eq("id", mem["id"]).execute()
 
-        # Generate receipt if amount was provided
+        # 3. Log Financial Receipt
         if amount_cents is not None:
             sb_admin.table("payment_receipts").insert({
                 "user_membership_id": mem["id"], "owner_user_id": mem["owner_user_id"],
@@ -229,8 +237,8 @@ def admin_users_overview():
         users = sb_admin.table("user_profiles").select("user_id,email,first_name,last_name,stripe_customer_id").order("first_name", desc=False).execute().data
         owner_ids = [u["user_id"] for u in users if u.get("user_id")]
         
-        # ✅ FIX: Request payment_provider from Supabase
-        memberships = sb_admin.table("user_memberships").select("id,owner_user_id,subject_user_id,dependent_id,plan_id,status,payment_provider").in_("owner_user_id", owner_ids).execute().data if owner_ids else []
+        # ✅ FIX: Fetch payment_provider, start, and end dates
+        memberships = sb_admin.table("user_memberships").select("id,owner_user_id,subject_user_id,dependent_id,plan_id,status,payment_provider,current_period_start,current_period_end").in_("owner_user_id", owner_ids).execute().data if owner_ids else []
         
         plans = {p["id"]: p for p in sb_admin.table("membership_plans").select("id,name,price_cents,currency,interval,interval_count").in_("id", list({m["plan_id"] for m in memberships})).execute().data} if memberships else {}
         periods_by_owner = {oid: [] for oid in owner_ids}
@@ -243,15 +251,40 @@ def admin_users_overview():
                     if _parse_ts(pr["period_start"]) <= now < _parse_ts(pr["period_end"]): return True
                 except Exception: continue
             return False
+            
         last_checkin_by_subject = {row["subject_user_id"]: row["scanned_at"] for row in sb_admin.table("gym_checkins").select("subject_user_id,scanned_at").in_("subject_user_id", owner_ids).order("scanned_at", desc=True).execute().data} if owner_ids else {}
+        
+        # ✅ FIX: Fetch Last Payment date from receipts
+        latest_payment_map = {}
+        latest_payment_amount_map = {} # New map for amounts
+        if owner_ids:
+            recent_payments = sb_admin.table("payment_receipts").select("owner_user_id, paid_at, amount_cents").in_("owner_user_id", owner_ids).order("paid_at", desc=True).execute().data
+            for p in recent_payments:
+                if p["owner_user_id"] not in latest_payment_map:
+                    latest_payment_map[p["owner_user_id"]] = p["paid_at"]
+                    latest_payment_amount_map[p["owner_user_id"]] = p["amount_cents"]
+
         active_w = sb_admin.table("waivers").select("id,version").eq("is_active", True).eq("required_for_purchase", True).limit(1).execute().data
         waiver_required = bool(active_w)
         signed_subjects = {s["subject_user_id"] for s in sb_admin.table("waiver_signatures").select("subject_user_id").eq("waiver_id", active_w[0]["id"]).eq("waiver_version", active_w[0]["version"]).is_("revoked_at", "null").in_("subject_user_id", owner_ids).execute().data} if waiver_required and owner_ids else set()
         mems_by_owner = {}
         for m in memberships: mems_by_owner.setdefault(m["owner_user_id"], []).append(m)
         
-        # ✅ FIX: Include payment_provider in the frontend payload
-        out_rows = [{"user_id": u["user_id"], "email": u.get("email"), "first_name": u.get("first_name"), "last_name": u.get("last_name"), "last_checkin_at": last_checkin_by_subject.get(u["user_id"]), "has_access_now": active_now(periods_by_owner.get(u["user_id"], [])), "waiver_required": waiver_required, "waiver_signed": (u["user_id"] in signed_subjects) if waiver_required else None, "memberships": [{"id": m["id"], "status": m.get("status"), "payment_provider": m.get("payment_provider"), "plan": plans.get(m.get("plan_id"))} for m in mems_by_owner.get(u["user_id"], [])], "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id"))} for u in users]
+        # ✅ FIX: Map all new data to frontend output
+        out_rows = [{
+            "user_id": u["user_id"], 
+            "email": u.get("email"), 
+            "first_name": u.get("first_name"), 
+            "last_name": u.get("last_name"), 
+            "last_checkin_at": last_checkin_by_subject.get(u["user_id"]), 
+            "last_payment_at": latest_payment_map.get(u["user_id"]),
+            "last_payment_amount": latest_payment_amount_map.get(u["user_id"]), # Added this
+            "has_access_now": active_now(periods_by_owner.get(u["user_id"], [])), 
+            "waiver_required": waiver_required, 
+            "waiver_signed": (u["user_id"] in signed_subjects) if waiver_required else None, 
+            "memberships": [{"id": m["id"], "status": m.get("status"), "payment_provider": m.get("payment_provider"), "current_period_start": m.get("current_period_start"), "current_period_end": m.get("current_period_end"), "plan": plans.get(m.get("plan_id"))} for m in mems_by_owner.get(u["user_id"], [])], 
+            "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id"))
+        } for u in users]
         return jsonify({"users": out_rows, "count": len(out_rows)})
     except Exception as e: return err(f"admin overview failed: {e}", 500)
 
@@ -297,91 +330,3 @@ def mailchimp_sync_users():
             synced += 1
         except Exception: failed += 1
     return jsonify({"ok": True, "synced": synced, "failed": failed})
-
-@admin_bp.post("/api/admin/memberships/manual")
-@auth_required
-@admin_required
-def log_manual_payment():
-    body = request.get_json(force=True, silent=True) or {}
-    
-    owner_user_id = body.get("user_id") # The main account holder
-    subject_type = (body.get("subject_type") or "user").lower()
-    subject_id = body.get("subject_id")
-    plan_id = body.get("plan_id")
-    amount_cents = body.get("amount_cents", 0)
-    notes = body.get("notes", "Paid in cash at front desk")
-    
-    if not owner_user_id or not plan_id:
-        return err("user_id and plan_id required", 400)
-        
-    try:
-        # 1. Get Plan Details
-        plan_res = sb_admin.table("membership_plans").select("*").eq("id", plan_id).limit(1).execute().data
-        if not plan_res: return err("Plan not found", 404)
-        plan = plan_res[0]
-        
-        # 2. Calculate Exact Expiration Date using your core add_interval logic
-        now = datetime.now(timezone.utc)
-        end_date = add_interval(now, plan.get("interval") or "month", plan.get("interval_count") or 1)
-        
-        start_str = now.isoformat()
-        end_str = end_date.isoformat()
-        
-        # Determine who actually gets the access (Adult or Dependent)
-        subject_uid = subject_id if subject_type == "user" else None
-        dependent_id = subject_id if subject_type == "dependent" else None
-        if not subject_uid and not dependent_id:
-            subject_uid = owner_user_id
-
-        # 3. Get or Create the Master Membership Folder
-        mem = ensure_membership(
-            owner_user_id=owner_user_id,
-            plan_id=plan_id,
-            subject_user_id=subject_uid,
-            dependent_id=dependent_id,
-            status="active"
-        )
-        
-        # ✅ FIX: Explicitly update the master membership with Cash and dates
-        sb_admin.table("user_memberships").update({
-            "status": "active",
-            "payment_provider": "cash",
-            "current_period_start": start_str,
-            "current_period_end": end_str
-        }).eq("id", mem["id"]).execute()
-        
-        # 4. Insert Payment Receipt for Accounting
-        sb_admin.table("payment_receipts").insert({
-            "user_membership_id": mem["id"],
-            "owner_user_id": owner_user_id,
-            "subject_user_id": subject_uid,
-            "dependent_id": dependent_id,
-            "plan_id": plan_id,
-            "source": "manual",
-            "external_type": "cash",
-            "status": "succeeded",
-            "amount_cents": int(amount_cents),
-            "currency": "USD",
-            "notes": notes,
-            "paid_at": start_str,
-            "created_by_user_id": g.user_id
-        }).execute()
-        
-        # 5. Insert Access Period for the Front Door Scanner
-        sb_admin.table("membership_periods").insert({
-            "user_membership_id": mem["id"],
-            "owner_user_id": owner_user_id,
-            "subject_user_id": subject_uid,
-            "dependent_id": dependent_id,
-            "plan_id": plan_id,
-            "source": "manual",
-            "period_start": start_str,
-            "period_end": end_str
-        }).execute()
-        
-        log.info(f"[{getattr(g, '_rid', '-')}] Manual cash payment processed for {owner_user_id} by admin {g.user_id}. Expires: {end_str}")
-        return jsonify({"ok": True, "message": "Cash payment recorded", "expires_at": end_str})
-        
-    except Exception as e:
-        log.error(f"Manual payment failed: {e}")
-        return err(f"Operation failed: {e}", 500)
