@@ -256,7 +256,7 @@ def admin_users_overview():
         
         # ✅ FIX: Fetch Last Payment date from receipts
         latest_payment_map = {}
-        latest_payment_amount_map = {} # New map for amounts
+        latest_payment_amount_map = {} 
         if owner_ids:
             recent_payments = sb_admin.table("payment_receipts").select("owner_user_id, paid_at, amount_cents").in_("owner_user_id", owner_ids).order("paid_at", desc=True).execute().data
             for p in recent_payments:
@@ -278,7 +278,7 @@ def admin_users_overview():
             "last_name": u.get("last_name"), 
             "last_checkin_at": last_checkin_by_subject.get(u["user_id"]), 
             "last_payment_at": latest_payment_map.get(u["user_id"]),
-            "last_payment_amount": latest_payment_amount_map.get(u["user_id"]), # Added this
+            "last_payment_amount": latest_payment_amount_map.get(u["user_id"]),
             "has_access_now": active_now(periods_by_owner.get(u["user_id"], [])), 
             "waiver_required": waiver_required, 
             "waiver_signed": (u["user_id"] in signed_subjects) if waiver_required else None, 
@@ -305,7 +305,17 @@ def admin_recent_checkins():
             if su:
                 prof = users_by_id.get(su, {})
                 label = f"{(prof.get('first_name') or '').strip()} {(prof.get('last_name') or '').strip()}".strip() or prof.get("email") or "Member"
-                items.append({"id": r["id"], "scanned_at": r.get("scanned_at"), "method": r.get("method"), "location": r.get("location"), "subject_type": "user", "subject_id": su, "subject_label": label, "email": prof.get("email")})
+                items.append({
+                    "id": r["id"], 
+                    "scanned_at": r.get("scanned_at"), 
+                    "method": r.get("method"), 
+                    "location": r.get("location"), 
+                    "subject_type": "user", 
+                    "subject_id": su, 
+                    "subject_label": label, 
+                    "email": prof.get("email"),
+                    "meta": r.get("meta", {}) # ✅ THE CRITICAL FIX: Explicitly passing the meta dict!
+                })
         return jsonify({"items": items, "count": len(items)})
     except Exception as e: return err(f"failed to load recent check-ins: {e}", 500)
 
