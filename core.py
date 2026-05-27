@@ -132,17 +132,46 @@ def ensure_membership(owner_user_id: str, plan_id: str, *, subject_user_id: str 
     mem = sb_admin.table("user_memberships").insert(payload).execute().data[0]
     return mem
 
+# Replace in core.py
 def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | None) -> bool:
     now = datetime.now(timezone.utc)
-    q = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False)
-    if subject_user_id: q = q.eq("subject_user_id", subject_user_id)
-    else: q = q.eq("dependent_id", dependent_id)
-    rows = q.execute().data
+    log.info(f"SCAN CHECK: Subject={subject_user_id} Dependent={dependent_id}")
+    
+    # 1. Fetch valid payment periods (Check BOTH Subject and Owner columns)
+    rows = []
+    if subject_user_id:
+        subj_rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("subject_user_id", subject_user_id).execute().data or []
+        own_rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("owner_user_id", subject_user_id).execute().data or []
+        rows = subj_rows + own_rows
+    else:
+        rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("dependent_id", dependent_id).execute().data or []
+        
+    # 2. Check if they have ANY valid payment period
+    has_valid_payment = False
     for r in rows:
         try:
-            if _parse_ts(r["period_start"]) <= now < _parse_ts(r["period_end"]): return True
-        except Exception: continue
-    return False
+            if _parse_ts(r["period_start"]) <= now < _parse_ts(r["period_end"]):
+                has_valid_payment = True
+                break
+        except Exception as e:
+            log.error(f"Time parsing error: {e}")
+            continue
+            
+    if not has_valid_payment:
+        log.info(f"SCAN FAILED: No active payment period found.")
+        return False
+        
+    # 3. VERIFY WAIVER
+    active_w = sb_admin.table("waivers").select("id,version").eq("is_active", True).eq("required_for_purchase", True).limit(1).execute().data
+    if active_w:
+        check_id = subject_user_id if subject_user_id else dependent_id
+        signed = sb_admin.table("waiver_signatures").select("id").eq("subject_user_id", check_id).eq("waiver_id", active_w[0]["id"]).eq("waiver_version", active_w[0]["version"]).is_("revoked_at", "null").limit(1).execute().data
+        if not signed:
+            log.info(f"SCAN FAILED: Waiver missing for user {check_id}")
+            return False 
+            
+    log.info(f"SCAN SUCCESS: Access Granted.")
+    return True
 
 def record_checkin(*, subject_type: str, subject_id: str, method: str = "qr", location: str | None = None, source: str | None = None, meta: dict | None = None) -> dict:
     row = {
