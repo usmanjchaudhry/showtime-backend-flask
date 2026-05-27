@@ -132,55 +132,63 @@ def ensure_membership(owner_user_id: str, plan_id: str, *, subject_user_id: str 
     mem = sb_admin.table("user_memberships").insert(payload).execute().data[0]
     return mem
 
-# Replace in core.py
 def has_access_now_for_subject(subject_user_id: str | None, dependent_id: str | None) -> bool:
     now = datetime.now(timezone.utc)
-    log.info(f"SCAN CHECK: Subject={subject_user_id} Dependent={dependent_id}")
     
-    # 1. Fetch valid payment periods (Check BOTH Subject and Owner columns)
+    # 1. Fetch valid payment periods
+    # We query for both subject_user_id AND owner_user_id to handle cash payments correctly
     rows = []
     if subject_user_id:
-        subj_rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("subject_user_id", subject_user_id).execute().data or []
-        own_rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("owner_user_id", subject_user_id).execute().data or []
-        rows = subj_rows + own_rows
+        q_subj = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("subject_user_id", subject_user_id).execute().data or []
+        q_own = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("owner_user_id", subject_user_id).execute().data or []
+        rows = q_subj + q_own
     else:
         rows = sb_admin.table("membership_periods").select("period_start,period_end").eq("is_voided", False).eq("dependent_id", dependent_id).execute().data or []
         
-    # 2. Check if they have ANY valid payment period
-    has_valid_payment = False
-    for r in rows:
-        try:
-            if _parse_ts(r["period_start"]) <= now < _parse_ts(r["period_end"]):
-                has_valid_payment = True
-                break
-        except Exception as e:
-            log.error(f"Time parsing error: {e}")
-            continue
-            
+    has_valid_payment = any(_parse_ts(r["period_start"]) <= now < _parse_ts(r["period_end"]) for r in rows)
+    
     if not has_valid_payment:
-        log.info(f"SCAN FAILED: No active payment period found.")
+        log.info(f"SCAN FAILED: No active payment period found for {subject_user_id}")
         return False
         
-    # 3. VERIFY WAIVER
+    # 2. Enforce Waiver
     active_w = sb_admin.table("waivers").select("id,version").eq("is_active", True).eq("required_for_purchase", True).limit(1).execute().data
     if active_w:
         check_id = subject_user_id if subject_user_id else dependent_id
         signed = sb_admin.table("waiver_signatures").select("id").eq("subject_user_id", check_id).eq("waiver_id", active_w[0]["id"]).eq("waiver_version", active_w[0]["version"]).is_("revoked_at", "null").limit(1).execute().data
         if not signed:
-            log.info(f"SCAN FAILED: Waiver missing for user {check_id}")
+            log.info(f"SCAN FAILED: Waiver missing for {check_id}")
             return False 
             
-    log.info(f"SCAN SUCCESS: Access Granted.")
+    log.info("SCAN SUCCESS: Access Granted.")
     return True
 
 def record_checkin(*, subject_type: str, subject_id: str, method: str = "qr", location: str | None = None, source: str | None = None, meta: dict | None = None) -> dict:
+    subj_id = subject_id if subject_type == "user" else None
+    dep_id = subject_id if subject_type == "dependent" else None
+    
+    # Calculate access status BEFORE inserting into the database
+    access_granted = has_access_now_for_subject(subj_id, dep_id)
+    
+    # Embed that status into the meta dictionary so it saves directly to Supabase
+    safe_meta = meta or {}
+    safe_meta["access_after"] = access_granted
+    
     row = {
-        "subject_user_id": subject_id if subject_type == "user" else None,
-        "dependent_id": subject_id if subject_type == "dependent" else None,
-        "method": method or "qr", "location": location, "source": source, "meta": meta or {},
+        "subject_user_id": subj_id,
+        "dependent_id": dep_id,
+        "method": method or "qr", 
+        "location": location, 
+        "source": source, 
+        "meta": safe_meta,
     }
+    
+    # Insert into the database (includes the access status!)
     rec = sb_admin.table("gym_checkins").insert(row).execute().data[0]
-    rec["has_access_now"] = has_access_now_for_subject(rec.get("subject_user_id"), rec.get("dependent_id"))
+    
+    # Ensures the active scanner UI still gets the top-level boolean it expects
+    rec["has_access_now"] = access_granted 
+    
     return rec
 
 def stripe_customer_dashboard_url(customer_id: str | None) -> str | None:
