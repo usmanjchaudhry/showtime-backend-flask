@@ -260,8 +260,8 @@ def checkout_finalize():
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET: return err("webhook not configured", 500)
 
-    # ✅ FIX: Use get_data() to preserve raw byte string for signature validation
-    payload = request.get_data(as_text=True)
+    # ✅ FIX: Use request.data to preserve raw byte string for signature validation
+    payload = request.data
     sig = request.headers.get("Stripe-Signature", "")
     try: 
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
