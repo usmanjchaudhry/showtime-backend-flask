@@ -372,3 +372,67 @@ def admin_user_payments(user_id: str):
     except Exception as e:
         log.exception(f"Failed to fetch user payments for {user_id}")
         return err(f"failed to fetch payments: {e}", 500)
+
+@admin_bp.get("/api/admin/users/multiple-stripe-memberships")
+@auth_required
+@admin_required
+def admin_multiple_stripe_memberships():
+    try:
+        # 1. Fetch active/trialing/past_due memberships
+        active_mems = sb_admin.table("user_memberships").select(
+            "owner_user_id, id, plan_id, status, provider_subscription_id"
+        ).in_("status", ["active", "past_due", "trialing"]).execute().data or []
+        
+        # 2. Filter for those with Stripe subscriptions
+        stripe_mems = [m for m in active_mems if m.get("provider_subscription_id")]
+        
+        # 3. Group by owner
+        by_owner = {}
+        for m in stripe_mems:
+            by_owner.setdefault(m["owner_user_id"], []).append(m)
+            
+        multi_owners = {k: v for k, v in by_owner.items() if len(v) > 1}
+        
+        if not multi_owners:
+            return jsonify({"users": []})
+            
+        # 4. Fetch user profiles
+        owner_ids = list(multi_owners.keys())
+        users = sb_admin.table("user_profiles").select(
+            "user_id,email,first_name,last_name,stripe_customer_id"
+        ).in_("user_id", owner_ids).execute().data or []
+        
+        # 5. Fetch plans
+        plan_ids = list({m["plan_id"] for mems in multi_owners.values() for m in mems})
+        plans = {p["id"]: p for p in sb_admin.table("membership_plans").select(
+            "id,name,price_cents,currency"
+        ).in_("id", plan_ids).execute().data} if plan_ids else {}
+        
+        # 6. Format output
+        out = []
+        for u in users:
+            uid = u["user_id"]
+            mems = multi_owners.get(uid, [])
+            out.append({
+                "user_id": uid,
+                "first_name": u.get("first_name"),
+                "last_name": u.get("last_name"),
+                "email": u.get("email"),
+                "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id")),
+                "memberships": [
+                    {
+                        "id": m["id"],
+                        "status": m["status"],
+                        "provider_subscription_id": m["provider_subscription_id"],
+                        "plan_name": plans.get(m["plan_id"], {}).get("name"),
+                        "price_cents": plans.get(m["plan_id"], {}).get("price_cents"),
+                        "currency": plans.get(m["plan_id"], {}).get("currency") or "USD",
+                    }
+                    for m in mems
+                ]
+            })
+            
+        return jsonify({"users": out, "count": len(out)})
+    except Exception as e:
+        log.exception("Failed to fetch multiple stripe memberships")
+        return err(f"failed to fetch: {e}", 500)
