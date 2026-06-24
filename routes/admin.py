@@ -436,3 +436,80 @@ def admin_multiple_stripe_memberships():
     except Exception as e:
         log.exception("Failed to fetch multiple stripe memberships")
         return err(f"failed to fetch: {e}", 500)
+
+@admin_bp.get("/api/admin/users/checkin-activity")
+@auth_required
+@admin_required
+def admin_checkin_activity():
+    try:
+        days = int(request.args.get("days", "30"))
+        
+        q = sb_admin.table("gym_checkins").select("subject_user_id, dependent_id, scanned_at, meta")
+        if days > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            q = q.gte("scanned_at", cutoff)
+            
+        checkins = q.execute().data or []
+        
+        stats = {}
+        for c in checkins:
+            uid = c.get("subject_user_id") or c.get("dependent_id")
+            if not uid: continue
+            
+            if uid not in stats:
+                stats[uid] = {
+                    "user_id": uid,
+                    "total_checkins": 0,
+                    "denied_checkins": 0,
+                    "last_checkin_at": None
+                }
+                
+            st = stats[uid]
+            st["total_checkins"] += 1
+            
+            meta = c.get("meta") or {}
+            # fallback to true if not present, but check both fields
+            access = meta.get("access_after", meta.get("has_access_now", True))
+            if not access:
+                st["denied_checkins"] += 1
+                
+            scanned_at = c.get("scanned_at")
+            if scanned_at:
+                if not st["last_checkin_at"] or scanned_at > st["last_checkin_at"]:
+                    st["last_checkin_at"] = scanned_at
+                    
+        # Fetch user profiles and dependents
+        user_ids = list(stats.keys())
+        users = []
+        if user_ids:
+            users = sb_admin.table("user_profiles").select("user_id, first_name, last_name, email").in_("user_id", user_ids).execute().data or []
+            
+            found_ids = {u["user_id"] for u in users}
+            missing_ids = [uid for uid in user_ids if uid not in found_ids]
+            
+            if missing_ids:
+                deps = sb_admin.table("dependents").select("id, first_name, last_name, email").in_("id", missing_ids).execute().data or []
+                for d in deps:
+                    users.append({
+                        "user_id": d["id"],
+                        "first_name": d.get("first_name"),
+                        "last_name": d.get("last_name"),
+                        "email": d.get("email"),
+                        "is_dependent": True
+                    })
+                    
+        user_map = {u["user_id"]: u for u in users}
+        
+        results = []
+        for uid, st in stats.items():
+            u = user_map.get(uid, {})
+            st["first_name"] = u.get("first_name")
+            st["last_name"] = u.get("last_name")
+            st["email"] = u.get("email")
+            st["is_dependent"] = u.get("is_dependent", False)
+            results.append(st)
+            
+        return jsonify({"activity": results, "count": len(results)})
+    except Exception as e:
+        log.exception("Failed to fetch checkin activity")
+        return err(f"failed to fetch checkin activity: {e}", 500)
