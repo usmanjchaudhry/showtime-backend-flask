@@ -340,3 +340,35 @@ def mailchimp_sync_users():
             synced += 1
         except Exception: failed += 1
     return jsonify({"ok": True, "synced": synced, "failed": failed})
+
+@admin_bp.get("/api/admin/users/<user_id>/payments")
+@auth_required
+@admin_required
+def admin_user_payments(user_id: str):
+    try:
+        # Fetch receipts
+        receipts = sb_admin.table("payment_receipts").select("*").eq("owner_user_id", user_id).order("paid_at", desc=True).execute().data or []
+        
+        # Fetch plan names
+        plan_ids = list({r["plan_id"] for r in receipts if r.get("plan_id")})
+        plans = {p["id"]: p for p in sb_admin.table("membership_plans").select("id,name").in_("id", plan_ids).execute().data} if plan_ids else {}
+
+        items = []
+        for r in receipts:
+            items.append({
+                "id": r["id"],
+                "paid_at": r["paid_at"],
+                "amount_cents": r["amount_cents"],
+                "currency": r.get("currency") or "USD",
+                "source": r.get("source"),
+                "external_type": r.get("external_type"),
+                "status": r.get("status"),
+                "notes": r.get("notes"),
+                "plan_name": plans.get(r.get("plan_id"), {}).get("name") if r.get("plan_id") else None,
+                "plan_id": r.get("plan_id")
+            })
+
+        return jsonify({"payments": items, "count": len(items)})
+    except Exception as e:
+        log.exception(f"Failed to fetch user payments for {user_id}")
+        return err(f"failed to fetch payments: {e}", 500)
