@@ -340,3 +340,176 @@ def mailchimp_sync_users():
             synced += 1
         except Exception: failed += 1
     return jsonify({"ok": True, "synced": synced, "failed": failed})
+
+@admin_bp.get("/api/admin/users/<user_id>/payments")
+@auth_required
+@admin_required
+def admin_user_payments(user_id: str):
+    try:
+        # Fetch receipts
+        receipts = sb_admin.table("payment_receipts").select("*").eq("owner_user_id", user_id).order("paid_at", desc=True).execute().data or []
+        
+        # Fetch plan names
+        plan_ids = list({r["plan_id"] for r in receipts if r.get("plan_id")})
+        plans = {p["id"]: p for p in sb_admin.table("membership_plans").select("id,name").in_("id", plan_ids).execute().data} if plan_ids else {}
+
+        items = []
+        for r in receipts:
+            items.append({
+                "id": r["id"],
+                "paid_at": r["paid_at"],
+                "amount_cents": r["amount_cents"],
+                "currency": r.get("currency") or "USD",
+                "source": r.get("source"),
+                "external_type": r.get("external_type"),
+                "status": r.get("status"),
+                "notes": r.get("notes"),
+                "plan_name": plans.get(r.get("plan_id"), {}).get("name") if r.get("plan_id") else None,
+                "plan_id": r.get("plan_id")
+            })
+
+        return jsonify({"payments": items, "count": len(items)})
+    except Exception as e:
+        log.exception(f"Failed to fetch user payments for {user_id}")
+        return err(f"failed to fetch payments: {e}", 500)
+
+@admin_bp.get("/api/admin/users/multiple-stripe-memberships")
+@auth_required
+@admin_required
+def admin_multiple_stripe_memberships():
+    try:
+        # 1. Fetch active/trialing/past_due memberships
+        active_mems = sb_admin.table("user_memberships").select(
+            "owner_user_id, id, plan_id, status, provider_subscription_id"
+        ).in_("status", ["active", "past_due", "trialing"]).execute().data or []
+        
+        # 2. Filter for those with Stripe subscriptions
+        stripe_mems = [m for m in active_mems if m.get("provider_subscription_id")]
+        
+        # 3. Group by owner
+        by_owner = {}
+        for m in stripe_mems:
+            by_owner.setdefault(m["owner_user_id"], []).append(m)
+            
+        multi_owners = {k: v for k, v in by_owner.items() if len(v) > 1}
+        
+        if not multi_owners:
+            return jsonify({"users": []})
+            
+        # 4. Fetch user profiles
+        owner_ids = list(multi_owners.keys())
+        users = sb_admin.table("user_profiles").select(
+            "user_id,email,first_name,last_name,stripe_customer_id"
+        ).in_("user_id", owner_ids).execute().data or []
+        
+        # 5. Fetch plans
+        plan_ids = list({m["plan_id"] for mems in multi_owners.values() for m in mems})
+        plans = {p["id"]: p for p in sb_admin.table("membership_plans").select(
+            "id,name,price_cents,currency"
+        ).in_("id", plan_ids).execute().data} if plan_ids else {}
+        
+        # 6. Format output
+        out = []
+        for u in users:
+            uid = u["user_id"]
+            mems = multi_owners.get(uid, [])
+            out.append({
+                "user_id": uid,
+                "first_name": u.get("first_name"),
+                "last_name": u.get("last_name"),
+                "email": u.get("email"),
+                "stripe_customer_url": stripe_customer_dashboard_url(u.get("stripe_customer_id")),
+                "memberships": [
+                    {
+                        "id": m["id"],
+                        "status": m["status"],
+                        "provider_subscription_id": m["provider_subscription_id"],
+                        "plan_name": plans.get(m["plan_id"], {}).get("name"),
+                        "price_cents": plans.get(m["plan_id"], {}).get("price_cents"),
+                        "currency": plans.get(m["plan_id"], {}).get("currency") or "USD",
+                    }
+                    for m in mems
+                ]
+            })
+            
+        return jsonify({"users": out, "count": len(out)})
+    except Exception as e:
+        log.exception("Failed to fetch multiple stripe memberships")
+        return err(f"failed to fetch: {e}", 500)
+
+@admin_bp.get("/api/admin/users/checkin-activity")
+@auth_required
+@admin_required
+def admin_checkin_activity():
+    try:
+        days = int(request.args.get("days", "30"))
+        
+        q = sb_admin.table("gym_checkins").select("subject_user_id, dependent_id, scanned_at, meta")
+        if days > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            q = q.gte("scanned_at", cutoff)
+            
+        checkins = q.execute().data or []
+        
+        stats = {}
+        for c in checkins:
+            uid = c.get("subject_user_id") or c.get("dependent_id")
+            if not uid: continue
+            
+            if uid not in stats:
+                stats[uid] = {
+                    "user_id": uid,
+                    "total_checkins": 0,
+                    "denied_checkins": 0,
+                    "last_checkin_at": None
+                }
+                
+            st = stats[uid]
+            st["total_checkins"] += 1
+            
+            meta = c.get("meta") or {}
+            # fallback to true if not present, but check both fields
+            access = meta.get("access_after", meta.get("has_access_now", True))
+            if not access:
+                st["denied_checkins"] += 1
+                
+            scanned_at = c.get("scanned_at")
+            if scanned_at:
+                if not st["last_checkin_at"] or scanned_at > st["last_checkin_at"]:
+                    st["last_checkin_at"] = scanned_at
+                    
+        # Fetch user profiles and dependents
+        user_ids = list(stats.keys())
+        users = []
+        if user_ids:
+            users = sb_admin.table("user_profiles").select("user_id, first_name, last_name, email").in_("user_id", user_ids).execute().data or []
+            
+            found_ids = {u["user_id"] for u in users}
+            missing_ids = [uid for uid in user_ids if uid not in found_ids]
+            
+            if missing_ids:
+                deps = sb_admin.table("dependents").select("id, first_name, last_name, email").in_("id", missing_ids).execute().data or []
+                for d in deps:
+                    users.append({
+                        "user_id": d["id"],
+                        "first_name": d.get("first_name"),
+                        "last_name": d.get("last_name"),
+                        "email": d.get("email"),
+                        "is_dependent": True
+                    })
+                    
+        user_map = {u["user_id"]: u for u in users}
+        
+        results = []
+        for uid, st in stats.items():
+            u = user_map.get(uid, {})
+            st["first_name"] = u.get("first_name")
+            st["last_name"] = u.get("last_name")
+            st["email"] = u.get("email")
+            st["is_dependent"] = u.get("is_dependent", False)
+            results.append(st)
+            
+        return jsonify({"activity": results, "count": len(results)})
+    except Exception as e:
+        log.exception("Failed to fetch checkin activity")
+        return err(f"failed to fetch checkin activity: {e}", 500)

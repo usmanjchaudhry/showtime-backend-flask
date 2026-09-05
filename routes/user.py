@@ -181,10 +181,7 @@ def _verify_qr_token(token: str) -> tuple[str, int]:
 @user_bp.get("/api/checkins/qr-token")
 @auth_required
 def get_qr_token():
-    try: ttl = int(request.args.get("ttl", "300"))
-    except Exception: ttl = 300
-    ttl = max(30, min(ttl, 1800))
-    exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=ttl)).timestamp())
+    exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp())
     return jsonify({"token": _sign_qr_token(g.user_id, exp_ts), "expires_at": exp_ts})
 
 # ───────────────────────── QR scanner (public/door) ─────────────────────
@@ -194,7 +191,6 @@ def public_qr_scan():
     token = (body.get("token") or "").strip()
     if not token: return err("token required", 400)
 
-    rid = getattr(g, "_rid", uuid4().hex[:8])
     try: user_id, exp_ts = _verify_qr_token(token)
     except ValueError as e: return err(str(e), 400)
     except Exception: return err("verification failed", 400)
